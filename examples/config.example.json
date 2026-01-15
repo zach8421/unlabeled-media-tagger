@@ -1,0 +1,24 @@
+{
+  "google_drive": {
+    "credentials_path": "credentials.json",
+    "token_path": "token.json",
+    "scopes": [
+      "https://www.googleapis.com/auth/drive.readonly",
+      "https://www.googleapis.com/auth/drive.file"
+    ],
+    "folder_id": "YOUR_FOLDER_ID_HERE"
+  },
+  "models": {
+    "face_detection_model": "models/face_detection.pth",
+    "face_recognition_model": "models/face_recognition.pth",
+    "object_detection_model": "models/object_detection.pth",
+    "detection_threshold": 0.7,
+    "device": "cpu"
+  },
+  "pipeline": {
+    "batch_size": 10,
+    "frame_interval": 1.0,
+    "max_frames": 100,
+    "output_dir": "./output"
+  }
+}
