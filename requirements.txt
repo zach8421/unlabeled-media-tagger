@@ -1,0 +1,26 @@
+# Core Dependencies
+# Install with: pip install -r requirements.txt
+
+# Dependencies will be added as implementation progresses
+# Examples that may be needed:
+
+# Google Drive API
+# google-auth>=2.0.0
+# google-auth-oauthlib>=1.0.0
+# google-api-python-client>=2.0.0
+
+# Computer Vision / Image Processing
+# opencv-python>=4.0.0
+# pillow>=9.0.0
+# numpy>=1.20.0
+
+# Machine Learning (facial recognition, object detection)
+# torch>=2.0.0
+# torchvision>=0.15.0
+# facenet-pytorch>=2.5.0
+# face-recognition>=1.3.0
+
+# Utilities
+# pyyaml>=6.0
+# python-dotenv>=1.0.0
+# tqdm>=4.65.0

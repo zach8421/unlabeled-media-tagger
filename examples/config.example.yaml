@@ -1,0 +1,23 @@
+# Example configuration for unlabeled-media-tagger
+# Copy this file to config.yaml and customize for your setup
+
+google_drive:
+  credentials_path: credentials.json
+  token_path: token.json
+  scopes:
+    - https://www.googleapis.com/auth/drive.readonly
+    - https://www.googleapis.com/auth/drive.file
+  folder_id: YOUR_FOLDER_ID_HERE
+
+models:
+  face_detection_model: models/face_detection.pth
+  face_recognition_model: models/face_recognition.pth
+  object_detection_model: models/object_detection.pth
+  detection_threshold: 0.7
+  device: cpu  # Options: cpu, cuda, mps
+
+pipeline:
+  batch_size: 10
+  frame_interval: 1.0  # seconds between frame extractions
+  max_frames: 100      # maximum frames per video
+  output_dir: ./output
