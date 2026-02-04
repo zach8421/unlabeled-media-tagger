@@ -105,6 +105,18 @@ pytest
 pytest --cov=unlabeled_media_tagger
 ```
 
+## 🧪 Drive Smoke Test
+
+Quick test of Google Drive OAuth and file operations:
+
+1. **Get OAuth credentials**: Create a Desktop app OAuth 2.0 Client ID in [Google Cloud Console](https://console.cloud.google.com/), enable Drive API, download JSON
+2. **Save as** `secrets/credentials.json`
+3. **Run**: `python scripts/drive_smoke_test.py`
+4. **Token caches to** `secrets/token.json` (auto-ignored by git)
+
+**Scope**: `https://www.googleapis.com/auth/drive` (full Drive access for prototype)
+
+
 ## 🛠️ Development
 
 ### Project Status
