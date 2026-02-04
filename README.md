@@ -1,96 +1,74 @@
 # unlabeled-media-tagger
 
-A modular pipeline for enriching unlabeled photos and videos in Google Drive using open-source computer vision and facial recognition models. The system detects faces and visual features, extracts frames and timestamps, compares faces across files, and writes discovered metadata back to the source media.
+A modular pipeline for enriching unlabeled photos and videos in Google Drive using open-source computer vision models. Currently supports face detection with DeepFace/RetinaFace, visual annotation of images and videos, and basic Google Drive OAuth integration. Face comparison, clustering, and metadata writeback are planned.
+
+## ✅ What Works Now
+
+- **Face Detection**: Detect faces in images using DeepFace (RetinaFace backend)
+- **Image Annotation**: Draw bounding boxes with confidence scores on detected faces
+- **Video Annotation**: Sample video frames (1 fps) and annotate each frame with face detection results
+- **Google Drive OAuth**: Local OAuth2 flow with token caching, file listing, and description updates
+- **Debug Outputs**: Annotated images/frames saved to `outputs/` directory (for demo/verification; final pipeline will likely store structured detection results and only render annotations on demand)
 
 ## 🚀 Features (Planned)
 
-- **Google Drive Integration**: Fetch and update media files directly from Google Drive
-- **Frame Extraction**: Extract frames from videos at configurable intervals
-- **Facial Detection & Recognition**: Detect faces and generate embeddings for comparison
+- **Google Drive Media I/O**: Download/upload media bytes (currently only metadata operations supported)
+- **Frame Extraction**: Extract frames at configurable intervals (currently fixed at 1 fps for video annotation)
+- **Face Recognition / Embeddings**: Generate and compare face embeddings for identity matching
 - **Object Detection**: Identify objects and scenes in images
 - **Face Clustering**: Compare and cluster similar faces across your media collection
 - **Metadata Enrichment**: Write discovered tags and metadata back to source files
 
-## 📁 Project Structure
+## 📁 Key Modules
 
-```
-unlabeled-media-tagger/
-├── src/
-│   └── unlabeled_media_tagger/
-│       ├── __init__.py
-│       ├── __main__.py           # Main entry point
-│       ├── pipeline/              # Pipeline stage modules
-│       │   ├── __init__.py
-│       │   ├── fetch.py          # Google Drive media retrieval
-│       │   ├── extract.py        # Frame and metadata extraction
-│       │   ├── detect.py         # Computer vision models
-│       │   ├── compare.py        # Face comparison and clustering
-│       │   └── enrich.py         # Metadata writeback
-│       ├── config/                # Configuration management
-│       │   ├── __init__.py
-│       │   └── settings.py       # Configuration classes
-│       └── utils/                 # Utility functions
-│           ├── __init__.py
-│           ├── logging.py        # Logging utilities
-│           └── file_utils.py     # File system utilities
-├── tests/                         # Test suite
-│   ├── pipeline/
-│   ├── config/
-│   └── utils/
-├── docs/                          # Documentation
-├── examples/                      # Example configurations and usage
-│   ├── config.example.json
-│   ├── config.example.yaml
-│   └── example_pipeline.py
-├── pyproject.toml                 # Project configuration
-├── requirements.txt               # Core dependencies
-├── requirements-dev.txt           # Development dependencies
-└── README.md                      # This file
-```
+**Working modules:**
+- `src/unlabeled_media_tagger/pipeline/detect_faces.py` - Face detection using DeepFace/RetinaFace
+- `src/unlabeled_media_tagger/pipeline/annotate_image.py` - Draw bounding boxes on images
+- `src/unlabeled_media_tagger/pipeline/annotate_video.py` - Sample frames and annotate video
+- `src/unlabeled_media_tagger/drive/auth.py` - Google Drive OAuth2 authentication
+- `src/unlabeled_media_tagger/drive/files.py` - Drive file operations (list, get, update)
+- `scripts/drive_smoke_test.py` - Drive integration smoke test
+
+**Planned (placeholders):**
+- `src/unlabeled_media_tagger/pipeline/fetch.py`, `extract.py`, `detect.py`, `compare.py`, `enrich.py` - Full pipeline stages for clustering and metadata writeback
 
 ## 🔧 Installation
+
+**Conda environment (recommended):**
 
 ```bash
 # Clone the repository
 git clone https://github.com/zach8421/unlabeled-media-tagger.git
 cd unlabeled-media-tagger
 
-# Install the package in development mode
-pip install -e .
+# Create conda environment from environment.yml
+conda env create -f environment.yml
 
-# Or install with development dependencies
-pip install -e ".[dev]"
+# Activate environment
+conda activate unlabeled-media-tagger
+
+# Install package in editable mode
+pip install -e .
 ```
+
+**Note**: TensorFlow and DeepFace are sensitive to version compatibility. The provided `environment.yml` contains the tested configuration.
 
 ## 📝 Usage
 
-### Basic Usage
-
-```python
-from unlabeled_media_tagger.pipeline.fetch import FetchStage
-from unlabeled_media_tagger.pipeline.extract import ExtractStage
-from unlabeled_media_tagger.pipeline.detect import DetectStage
-from unlabeled_media_tagger.pipeline.compare import CompareStage
-from unlabeled_media_tagger.pipeline.enrich import EnrichStage
-from unlabeled_media_tagger.config.settings import Config
-
-# Initialize configuration
-config = Config()
-
-# Initialize and run pipeline stages
-# (Implementation pending)
-```
-
-See `examples/example_pipeline.py` for a more complete example.
-
-### Configuration
-
-Copy one of the example configuration files and customize for your setup:
+### Face Detection
 
 ```bash
-cp examples/config.example.yaml config.yaml
-# Edit config.yaml with your settings
+# Detect faces in an image
+python -m unlabeled_media_tagger.pipeline.detect_faces tests/assets/sample_image.jpg
+
+# Annotate image with bounding boxes
+python -m unlabeled_media_tagger.pipeline.annotate_image tests/assets/sample_image.jpg
+
+# Annotate video (samples at 1 fps)
+python -m unlabeled_media_tagger.pipeline.annotate_video tests/assets/sample_video.mpeg
 ```
+
+**Output**: Annotated images/frames are saved to `outputs/` directory (debug/demo artifacts).
 
 ## 🧪 Testing
 
@@ -105,23 +83,31 @@ pytest
 pytest --cov=unlabeled_media_tagger
 ```
 
+**Note**: Tests are currently minimal / in progress.
+
 ## 🧪 Drive Smoke Test
 
-Quick test of Google Drive OAuth and file operations:
+Test Google Drive OAuth and file operations:
 
-1. **Get OAuth credentials**: Create a Desktop app OAuth 2.0 Client ID in [Google Cloud Console](https://console.cloud.google.com/), enable Drive API, download JSON
-2. **Save as** `secrets/credentials.json`
-3. **Run**: `python scripts/drive_smoke_test.py`
-4. **Token caches to** `secrets/token.json` (auto-ignored by git)
+**Setup:**
+1. Go to [Google Cloud Console](https://console.cloud.google.com/)
+2. Create/select project, enable Google Drive API
+3. Create OAuth 2.0 Client ID (Desktop app type)
+4. Download credentials JSON and save as `secrets/credentials.json`
 
-**Scope**: `https://www.googleapis.com/auth/drive` (full Drive access for prototype)
+**Run:**
+```bash
+python scripts/drive_smoke_test.py
+```
+
+First run opens browser for OAuth consent. Token caches to `secrets/token.json`. By default, it updates the description of the first non-folder item in the folder.
+
+**⚠️ Security**: Never commit `secrets/` directory (already in `.gitignore`)
+
+**Scope used**: `https://www.googleapis.com/auth/drive` (full Drive access - prototype only)
 
 
 ## 🛠️ Development
-
-### Project Status
-
-⚠️ **This project is currently in the initial skeleton phase.** The structure and modules are in place, but implementation is pending.
 
 ### Pipeline Stages
 
