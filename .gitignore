@@ -216,3 +216,9 @@ token.json
 
 # annotated outputs
 outputs/
+
+# Ignore assets directory, which may contain large files that are not necessary to track in version control
+tests/assets/
+
+# Ignore demo files
+demo_faces.csv

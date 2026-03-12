@@ -12,6 +12,7 @@ google-auth-oauthlib>=1.0.0
 # Computer Vision / Image Processing
 # opencv-python>=4.0.0
 # pillow>=9.0.0
+pillow>=9.0.0
 # numpy>=1.20.0
 
 # Machine Learning (facial recognition, object detection)
