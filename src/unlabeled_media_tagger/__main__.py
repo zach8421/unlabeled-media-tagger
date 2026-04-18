@@ -1,13 +1,7 @@
-"""
-Main entry point for the unlabeled-media-tagger application.
-"""
+"""Main entry point for the unlabeled-media-tagger application."""
 
-
-def main():
-    """Main entry point for the application."""
-    # TODO: Implement pipeline orchestration
-    pass
+from unlabeled_media_tagger.pipeline.run import main
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

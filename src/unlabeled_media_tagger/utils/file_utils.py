@@ -7,7 +7,17 @@ from typing import List
 
 
 SUPPORTED_IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp'}
-SUPPORTED_VIDEO_EXTENSIONS = {'.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv'}
+SUPPORTED_VIDEO_EXTENSIONS = {
+    '.mp4',
+    '.avi',
+    '.mov',
+    '.mkv',
+    '.wmv',
+    '.flv',
+    '.mpeg',
+    '.mpg',
+    '.m4v',
+}
 
 
 def is_image_file(file_path: str) -> bool:

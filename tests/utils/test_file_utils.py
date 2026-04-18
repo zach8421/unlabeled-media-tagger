@@ -28,5 +28,8 @@ def test_is_video_file():
     assert is_video_file("video.mkv") is True
     assert is_video_file("video.wmv") is True
     assert is_video_file("video.flv") is True
+    assert is_video_file("video.mpeg") is True
+    assert is_video_file("video.mpg") is True
+    assert is_video_file("video.m4v") is True
     assert is_video_file("photo.jpg") is False
     assert is_video_file("document.pdf") is False

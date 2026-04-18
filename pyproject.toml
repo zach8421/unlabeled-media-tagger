@@ -26,14 +26,13 @@ classifiers = [
 ]
 
 dependencies = [
-    # Core dependencies will be added as implementation progresses
-    # Examples that may be needed:
-    # "google-auth>=2.0.0",
-    # "google-auth-oauthlib>=1.0.0",
-    # "google-api-python-client>=2.0.0",
-    # "opencv-python>=4.0.0",
-    # "pillow>=9.0.0",
-    # "numpy>=1.20.0",
+    "google-api-python-client>=2.0.0",
+    "google-auth>=2.0.0",
+    "google-auth-httplib2>=0.1.0",
+    "google-auth-oauthlib>=1.0.0",
+    "opencv-python>=4.0.0",
+    "pillow>=9.0.0",
+    "deepface>=0.0.98",
 ]
 
 [project.optional-dependencies]

@@ -1,9 +1,42 @@
 """Google Drive file operations module."""
 
+from __future__ import annotations
+
+import re
+from pathlib import Path
 from typing import Optional
 
+FOLDER_URL_RE = re.compile(r"/folders/([a-zA-Z0-9_-]+)")
+OPEN_URL_RE = re.compile(r"[?&]id=([a-zA-Z0-9_-]+)")
 
-def list_files_in_folder(service, folder_id: str, page_size: int = 20) -> list[dict]:
+
+def parse_drive_folder_id(location: str) -> str:
+    """
+    Parse a Google Drive folder ID from a raw ID or common folder URL.
+
+    Args:
+        location: Google Drive folder ID or URL.
+
+    Returns:
+        Folder ID string.
+    """
+    folder_match = FOLDER_URL_RE.search(location)
+    if folder_match:
+        return folder_match.group(1)
+
+    open_match = OPEN_URL_RE.search(location)
+    if open_match:
+        return open_match.group(1)
+
+    return location.strip()
+
+
+def list_files_in_folder(
+    service,
+    folder_id: str,
+    page_size: int = 100,
+    mime_prefixes: Optional[list[str]] = None,
+) -> list[dict]:
     """
     List files in a Google Drive folder.
     
@@ -16,16 +49,62 @@ def list_files_in_folder(service, folder_id: str, page_size: int = 20) -> list[d
         list[dict]: List of file metadata dictionaries with keys:
                     id, name, mimeType, modifiedTime, description
     """
-    query = f"'{folder_id}' in parents and trashed=false"
-    
-    results = service.files().list(
-        q=query,
-        pageSize=page_size,
-        fields="files(id,name,mimeType,modifiedTime,description)"
-    ).execute()
-    
-    files = results.get("files", [])
+    query_parts = [f"'{folder_id}' in parents", "trashed=false"]
+    if mime_prefixes:
+        mime_query = " or ".join(
+            f"mimeType contains '{mime_prefix}'" for mime_prefix in mime_prefixes
+        )
+        query_parts.append(f"({mime_query})")
+
+    files = []
+    page_token = None
+    while True:
+        results = service.files().list(
+            q=" and ".join(query_parts),
+            pageSize=page_size,
+            pageToken=page_token,
+            fields="nextPageToken,files(id,name,mimeType,modifiedTime,description,size)",
+        ).execute()
+
+        files.extend(results.get("files", []))
+        page_token = results.get("nextPageToken")
+        if not page_token:
+            break
+
     return files
+
+
+def download_file(service, file_id: str, destination_path: str) -> str:
+    """
+    Download a Google Drive file to a local path.
+
+    Args:
+        service: Authenticated Google Drive service.
+        file_id: Google Drive file ID.
+        destination_path: Local output path.
+
+    Returns:
+        Local destination path.
+    """
+    try:
+        from googleapiclient.http import MediaIoBaseDownload
+    except ImportError as exc:
+        raise ImportError(
+            "Google Drive dependencies are not installed. Install the package "
+            "with runtime dependencies or run: pip install -r requirements.txt"
+        ) from exc
+
+    destination = Path(destination_path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+
+    request = service.files().get_media(fileId=file_id)
+    with destination.open("wb") as file_handle:
+        downloader = MediaIoBaseDownload(file_handle, request)
+        done = False
+        while not done:
+            _, done = downloader.next_chunk()
+
+    return str(destination)
 
 
 def update_file_description(service, file_id: str, description: str) -> dict:
