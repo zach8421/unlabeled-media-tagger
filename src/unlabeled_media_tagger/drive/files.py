@@ -135,11 +135,11 @@ def update_file_description(service, file_id: str, description: str) -> dict:
 def get_file(service, file_id: str) -> dict:
     """
     Get a file's metadata from Google Drive.
-    
+
     Args:
         service: Authenticated Google Drive service
         file_id: The ID of the file to retrieve
-        
+
     Returns:
         dict: File metadata with keys: id, name, description
     """
@@ -147,5 +147,162 @@ def get_file(service, file_id: str) -> dict:
         fileId=file_id,
         fields="id,name,description"
     ).execute()
-    
+
     return file
+
+
+FOLDER_MIME_TYPE = "application/vnd.google-apps.folder"
+
+
+def upload_file(
+    service,
+    local_path: str,
+    parent_folder_id: str,
+    mime_type: str = "image/jpeg",
+) -> str:
+    """
+    Upload a local file to a Google Drive folder.
+
+    Args:
+        service: Authenticated Google Drive service.
+        local_path: Path to the local file to upload.
+        parent_folder_id: Drive folder ID to upload into.
+        mime_type: MIME type to associate with the uploaded file.
+
+    Returns:
+        Drive file ID of the newly created file.
+    """
+    try:
+        from googleapiclient.http import MediaFileUpload
+    except ImportError as exc:
+        raise ImportError(
+            "Google Drive dependencies are not installed. Install the package "
+            "with runtime dependencies or run: pip install -r requirements.txt"
+        ) from exc
+
+    source = Path(local_path)
+    media = MediaFileUpload(str(source), mimetype=mime_type, resumable=False)
+    created = service.files().create(
+        body={"name": source.name, "parents": [parent_folder_id]},
+        media_body=media,
+        fields="id",
+    ).execute()
+    return created["id"]
+
+
+def create_folder(service, name: str, parent_folder_id: str) -> str:
+    """
+    Create a folder inside a parent Drive folder.
+
+    Args:
+        service: Authenticated Google Drive service.
+        name: Name for the new subfolder.
+        parent_folder_id: Drive folder ID that will contain the new folder.
+
+    Returns:
+        Drive folder ID of the newly created subfolder.
+    """
+    created = service.files().create(
+        body={
+            "name": name,
+            "mimeType": FOLDER_MIME_TYPE,
+            "parents": [parent_folder_id],
+        },
+        fields="id",
+    ).execute()
+    return created["id"]
+
+
+def list_subfolders(service, parent_folder_id: str, page_size: int = 100) -> list[dict]:
+    """
+    List immediate subfolders of a Drive folder.
+
+    Args:
+        service: Authenticated Google Drive service.
+        parent_folder_id: Drive folder ID whose subfolders to list.
+        page_size: Page size for the listing call.
+
+    Returns:
+        List of dicts with keys ``id`` and ``name`` for each subfolder.
+    """
+    query = (
+        f"'{parent_folder_id}' in parents "
+        f"and mimeType='{FOLDER_MIME_TYPE}' "
+        "and trashed=false"
+    )
+
+    folders: list[dict] = []
+    page_token = None
+    while True:
+        results = service.files().list(
+            q=query,
+            pageSize=page_size,
+            pageToken=page_token,
+            fields="nextPageToken,files(id,name)",
+        ).execute()
+        folders.extend(results.get("files", []))
+        page_token = results.get("nextPageToken")
+        if not page_token:
+            break
+
+    return folders
+
+
+def delete_folder(service, folder_id: str) -> None:
+    """
+    Permanently delete a Drive folder and its descendants.
+
+    Drive's ``files.delete`` permanently removes the target file/folder; for a
+    folder this cascades to all contained items.
+
+    Args:
+        service: Authenticated Google Drive service.
+        folder_id: Drive folder ID to delete.
+    """
+    service.files().delete(fileId=folder_id).execute()
+
+
+def verify_folder_writable(service, folder_id: str) -> None:
+    """
+    Verify a Drive folder ID resolves to a folder the user can write into.
+
+    Performs a single ``files.get`` call to confirm:
+    - The folder ID resolves (raises ``FileNotFoundError`` if not).
+    - The ID is actually a folder, not another file type
+      (raises ``NotADirectoryError`` otherwise).
+    - The authenticated user can add children to it
+      (raises ``PermissionError`` otherwise).
+
+    Args:
+        service: Authenticated Google Drive service.
+        folder_id: Drive folder ID to verify.
+    """
+    try:
+        from googleapiclient.errors import HttpError
+    except ImportError as exc:
+        raise ImportError(
+            "Google Drive dependencies are not installed. Install the package "
+            "with runtime dependencies or run: pip install -r requirements.txt"
+        ) from exc
+
+    try:
+        meta = service.files().get(
+            fileId=folder_id,
+            fields="id,name,mimeType,capabilities/canAddChildren",
+        ).execute()
+    except HttpError as exc:
+        raise FileNotFoundError(
+            f"Drive folder {folder_id!r} could not be accessed: {exc}"
+        ) from exc
+
+    if meta.get("mimeType") != FOLDER_MIME_TYPE:
+        raise NotADirectoryError(
+            f"Drive ID {folder_id!r} resolves to a non-folder: "
+            f"name={meta.get('name', '?')!r} mimeType={meta.get('mimeType', '?')!r}"
+        )
+
+    if not meta.get("capabilities", {}).get("canAddChildren"):
+        raise PermissionError(
+            f"Drive folder {folder_id!r} (name={meta.get('name', '?')!r}) "
+            "is not writable by the authenticated user"
+        )

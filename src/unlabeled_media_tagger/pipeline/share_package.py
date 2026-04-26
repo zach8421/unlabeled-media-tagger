@@ -5,11 +5,24 @@ from __future__ import annotations
 import csv
 import html
 import json
+import re
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from PIL import Image
+
+from unlabeled_media_tagger.drive.files import (
+    create_folder,
+    delete_folder,
+    list_subfolders,
+    upload_file,
+)
+
+
+CONTACT_SHEET_DIR_NAME = "contact_sheets"
+DRIVE_URL_TEMPLATE = "https://drive.google.com/uc?export=view&id={file_id}"
+AUTO_SUBFOLDER_PATTERN = re.compile(r"^contact_sheets_\d{4}-\d{2}-\d{2}_\d{6}$")
 
 
 SHARED_COLUMNS = [
@@ -52,12 +65,27 @@ def cluster_rows(rows: list[dict]) -> dict[str, list[dict]]:
     return dict(sorted(grouped.items()))
 
 
-def summarize_clusters(grouped: dict[str, list[dict]], contact_sheet_dir: str) -> list[dict]:
+def summarize_clusters(
+    grouped: dict[str, list[dict]],
+    contact_sheet_dir: str,
+    url_by_label: dict[str, str] | None = None,
+) -> list[dict]:
+    """Build per-cluster summary rows for the share package.
+
+    ``url_by_label`` maps a cluster label to a remote URL (e.g. a Drive URL)
+    for that cluster's contact sheet. When a label has an entry, the
+    ``contact_sheet`` column carries the URL; otherwise it falls back to the
+    relative local path ``<contact_sheet_dir>/<cluster_label>.jpg``.
+    """
+    url_by_label = url_by_label or {}
     summaries = []
     for cluster_label, rows in grouped.items():
         media_names = sorted({row.get("media_name", "") for row in rows if row.get("media_name")})
         drive_ids = sorted({row.get("drive_id", "") for row in rows if row.get("drive_id")})
         cluster_id = rows[0].get("cluster_id", "") if rows else ""
+        contact_sheet_value = url_by_label.get(
+            cluster_label, f"{contact_sheet_dir}/{cluster_label}.jpg"
+        )
         summaries.append(
             {
                 "cluster_id": cluster_id,
@@ -66,7 +94,7 @@ def summarize_clusters(grouped: dict[str, list[dict]], contact_sheet_dir: str) -
                 "media_file_count": len(media_names),
                 "drive_file_count": len(drive_ids),
                 "example_media_names": "; ".join(media_names[:5]),
-                "contact_sheet": f"{contact_sheet_dir}/{cluster_label}.jpg",
+                "contact_sheet": contact_sheet_value,
             }
         )
 
@@ -269,16 +297,27 @@ This folder contains shareable review artifacts from `unlabeled-media-tagger`.
     (out_dir / "README_results.md").write_text(readme)
 
 
-def write_index(out_dir: Path, summaries: list[dict], metadata: dict | None = None) -> None:
+def write_index(
+    out_dir: Path,
+    summaries: list[dict],
+    contact_sheet_dir: str,
+    metadata: dict | None = None,
+) -> None:
+    """Write ``index.html`` next to the local ``contact_sheet_dir``.
+
+    The HTML always references the local relative paths (so it remains a
+    standalone offline companion to ``contact_sheets/``), independent of
+    whether the CSV's ``contact_sheet`` column carries a Drive URL.
+    """
     rows_html = []
     for summary in summaries:
-        sheet = summary["contact_sheet"]
+        local_sheet = f"{contact_sheet_dir}/{summary['cluster_label']}.jpg"
         rows_html.append(
             "<tr>"
             f"<td>{html.escape(summary['cluster_label'])}</td>"
             f"<td>{summary['face_count']}</td>"
             f"<td>{summary['media_file_count']}</td>"
-            f"<td><a href='{html.escape(sheet)}'><img src='{html.escape(sheet)}' alt='{html.escape(summary['cluster_label'])}'></a></td>"
+            f"<td><a href='{html.escape(local_sheet)}'><img src='{html.escape(local_sheet)}' alt='{html.escape(summary['cluster_label'])}'></a></td>"
             f"<td>{html.escape(summary['example_media_names'])}</td>"
             "</tr>"
         )
@@ -334,13 +373,128 @@ def write_index(out_dir: Path, summaries: list[dict], metadata: dict | None = No
     (out_dir / "index.html").write_text(page)
 
 
+def generate_auto_subfolder_name(now: datetime | None = None) -> str:
+    """Return an auto-timestamped subfolder name in UTC.
+
+    The name matches ``AUTO_SUBFOLDER_PATTERN`` exactly; the cleanup logic
+    relies on that strict shape.
+    """
+    moment = now or datetime.now(timezone.utc)
+    return moment.strftime("contact_sheets_%Y-%m-%d_%H%M%S")
+
+
+def cleanup_auto_subfolders(
+    service,
+    parent_folder_id: str,
+    verbose: bool = False,
+) -> dict:
+    """Delete every auto-timestamped subfolder under ``parent_folder_id``.
+
+    Custom-named subfolders (anything not matching ``AUTO_SUBFOLDER_PATTERN``)
+    are preserved. If a delete fails partway, the exception is re-raised after
+    surfacing what was deleted vs. what remained, so the user can finish
+    cleanup manually before rerunning.
+    """
+    existing = list_subfolders(service, parent_folder_id)
+    deleted: list[dict] = []
+    preserved: list[dict] = [
+        sub for sub in existing if not AUTO_SUBFOLDER_PATTERN.match(sub["name"])
+    ]
+    targets = [sub for sub in existing if AUTO_SUBFOLDER_PATTERN.match(sub["name"])]
+
+    if verbose:
+        print(
+            f"Cleanup: {len(targets)} auto-timestamped subfolder(s) to delete, "
+            f"{len(preserved)} custom-named subfolder(s) preserved.",
+            flush=True,
+        )
+
+    for sub in targets:
+        try:
+            delete_folder(service, sub["id"])
+        except Exception as exc:
+            remaining = [item for item in targets if item not in deleted]
+            print(
+                "Cleanup failed partway through. "
+                f"Deleted: {[item['name'] for item in deleted]}. "
+                f"Not yet deleted: {[item['name'] for item in remaining]}.",
+                flush=True,
+            )
+            raise RuntimeError(
+                f"Failed to delete subfolder {sub['name']!r} "
+                f"(id={sub['id']!r}) under parent {parent_folder_id!r}: {exc}"
+            ) from exc
+        deleted.append(sub)
+        if verbose:
+            print(f"  deleted: {sub['name']} (id={sub['id']})", flush=True)
+
+    return {
+        "deleted": deleted,
+        "preserved": preserved,
+    }
+
+
+def upload_contact_sheets(
+    service,
+    subfolder_id: str,
+    contact_dir: Path,
+    cluster_labels: list[str],
+    verbose: bool = False,
+) -> dict[str, str]:
+    """Upload each cluster's local contact-sheet JPEG and return label→URL.
+
+    Clusters whose local JPEG is missing or whose upload fails are omitted
+    from the returned mapping; the caller falls back to the local relative
+    path for those (per the slice's failure-mode policy: log + continue).
+    """
+    url_by_label: dict[str, str] = {}
+    for label in cluster_labels:
+        local_path = contact_dir / f"{label}.jpg"
+        if not local_path.exists():
+            if verbose:
+                print(
+                    f"  skip upload (no local JPEG): {label}",
+                    flush=True,
+                )
+            continue
+        try:
+            file_id = upload_file(
+                service,
+                str(local_path),
+                subfolder_id,
+                mime_type="image/jpeg",
+            )
+        except Exception as exc:
+            print(
+                f"  upload failed for {label} ({local_path}): {exc} -- "
+                "falling back to local relative path for this cluster.",
+                flush=True,
+            )
+            continue
+        url_by_label[label] = DRIVE_URL_TEMPLATE.format(file_id=file_id)
+        if verbose:
+            print(f"  uploaded: {label} -> {file_id}", flush=True)
+    return url_by_label
+
+
 def build_share_package(
     csv_path: Path,
     out_dir: Path,
     metadata: dict | None = None,
+    drive_service=None,
+    drive_folder_id: str | None = None,
+    subfolder_name: str | None = None,
+    cleanup_old_subfolders: bool = False,
+    verbose: bool = False,
 ) -> dict:
-    """Build a shareable review package and return summary counts."""
-    contact_dir = out_dir / "contact_sheets"
+    """Build a shareable review package and return summary counts.
+
+    When ``drive_service`` and ``drive_folder_id`` are both provided, the
+    pipeline uploads each contact-sheet JPEG to a subfolder of the configured
+    Drive folder and writes Drive URLs into ``face_clusters_summary.csv``.
+    Otherwise the CSV carries relative paths exactly like slice 2.
+    """
+    contact_dir = out_dir / CONTACT_SHEET_DIR_NAME
     out_dir.mkdir(parents=True, exist_ok=True)
     contact_dir.mkdir(parents=True, exist_ok=True)
 
@@ -354,14 +508,80 @@ def build_share_package(
             out_path=contact_dir / f"{cluster_label}.jpg",
         )
 
-    summaries = summarize_clusters(grouped, "contact_sheets")
+    uploads_enabled = drive_service is not None and drive_folder_id is not None
+    url_by_label: dict[str, str] = {}
+    upload_summary: dict | None = None
+
+    if uploads_enabled:
+        if cleanup_old_subfolders:
+            cleanup_result = cleanup_auto_subfolders(
+                drive_service, drive_folder_id, verbose=verbose
+            )
+        else:
+            cleanup_result = {"deleted": [], "preserved": []}
+
+        resolved_subfolder_name = subfolder_name or generate_auto_subfolder_name()
+
+        existing = list_subfolders(drive_service, drive_folder_id)
+        if any(item["name"] == resolved_subfolder_name for item in existing):
+            raise FileExistsError(
+                f"Subfolder {resolved_subfolder_name!r} already exists under "
+                f"Drive folder {drive_folder_id!r}. Pick a different "
+                "--contact-sheets-subfolder-name or delete the existing "
+                "subfolder."
+            )
+
+        if verbose:
+            print(
+                f"Creating contact-sheet subfolder: {resolved_subfolder_name}",
+                flush=True,
+            )
+        subfolder_id = create_folder(
+            drive_service, resolved_subfolder_name, drive_folder_id
+        )
+
+        url_by_label = upload_contact_sheets(
+            drive_service,
+            subfolder_id,
+            contact_dir,
+            list(grouped.keys()),
+            verbose=verbose,
+        )
+
+        upload_summary = {
+            "subfolder_name": resolved_subfolder_name,
+            "subfolder_id": subfolder_id,
+            "uploaded": len(url_by_label),
+            "expected": len(grouped),
+            "fallback_to_local": [
+                label for label in grouped.keys() if label not in url_by_label
+            ],
+            "cleanup_deleted": [item["name"] for item in cleanup_result["deleted"]],
+            "cleanup_preserved": [item["name"] for item in cleanup_result["preserved"]],
+        }
+    elif drive_folder_id is None and drive_service is None:
+        if verbose:
+            print(
+                "Drive uploads not configured -- contact_sheet column will "
+                "carry local relative paths.",
+                flush=True,
+            )
+
+    summaries = summarize_clusters(
+        grouped,
+        CONTACT_SHEET_DIR_NAME,
+        url_by_label=url_by_label,
+    )
     write_summary_csv(summaries, out_dir / "face_clusters_summary.csv")
     write_readme(out_dir, csv_path, summaries, metadata=metadata)
-    write_index(out_dir, summaries, metadata=metadata)
+    write_index(out_dir, summaries, CONTACT_SHEET_DIR_NAME, metadata=metadata)
 
-    return {
+    result = {
         "out_dir": str(out_dir),
         "rows": len(rows),
         "clusters": len(summaries),
         "contact_dir": str(contact_dir),
     }
+    if upload_summary is not None:
+        result["upload"] = upload_summary
+    return result

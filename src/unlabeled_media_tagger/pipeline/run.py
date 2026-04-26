@@ -10,7 +10,11 @@ from pathlib import Path
 from typing import Optional
 
 from unlabeled_media_tagger.drive.auth import get_drive_service
-from unlabeled_media_tagger.drive.files import get_file
+from unlabeled_media_tagger.drive.files import (
+    get_file,
+    parse_drive_folder_id,
+    verify_folder_writable,
+)
 from unlabeled_media_tagger.pipeline.compare import CompareStage
 from unlabeled_media_tagger.pipeline.detect import DetectStage
 from unlabeled_media_tagger.pipeline.enrich import EnrichStage, build_drive_metadata
@@ -70,6 +74,9 @@ class MediaTaggingPipeline:
         write_drive_descriptions: bool = False,
         recursive: bool = False,
         share_package: bool = True,
+        contact_sheets_drive_folder_id: Optional[str] = None,
+        contact_sheets_subfolder_name: Optional[str] = None,
+        cleanup_old_subfolders: bool = False,
     ) -> dict:
         """
         Run the full media tagging pipeline.
@@ -82,6 +89,16 @@ class MediaTaggingPipeline:
             recursive: Whether to walk nested Drive folders.
             share_package: Whether to build the share package under
                 ``<output_dir>/share/`` after writing the cluster CSV.
+            contact_sheets_drive_folder_id: Optional Drive folder ID (or URL)
+                that will receive uploaded contact-sheet JPEGs. When set, the
+                summary CSV's ``contact_sheet`` column carries Drive URLs;
+                when unset, it carries local relative paths (slice 2 behavior).
+            contact_sheets_subfolder_name: Optional custom name for the new
+                subfolder created under the configured Drive folder. When
+                unset an auto-timestamped name is used.
+            cleanup_old_subfolders: When True, delete every auto-timestamped
+                subfolder under the configured Drive folder *before* the new
+                upload runs. Custom-named subfolders are never touched.
 
         Returns:
             Summary dictionary with output paths and counts.
@@ -95,11 +112,27 @@ class MediaTaggingPipeline:
         verbose = bool(self.config.get("verbose", False))
         use_processing_cache = bool(self.config.get("use_processing_cache", True))
 
+        contact_sheets_folder_id = (
+            parse_drive_folder_id(contact_sheets_drive_folder_id)
+            if contact_sheets_drive_folder_id
+            else None
+        )
+
         if verbose:
             print("Starting unlabeled-media-tagger pipeline.", flush=True)
             print(f"Output directory: {output_path}", flush=True)
             print("Authenticating with Google Drive...", flush=True)
         service = self.get_service()
+
+        if contact_sheets_folder_id:
+            if verbose:
+                print(
+                    "Verifying writability of contact-sheets Drive folder: "
+                    f"{contact_sheets_folder_id}",
+                    flush=True,
+                )
+            verify_folder_writable(service, contact_sheets_folder_id)
+
         fetch_stage = FetchStage(
             {
                 **self.config.get("fetch", {}),
@@ -170,11 +203,20 @@ class MediaTaggingPipeline:
             print(f"Wrote cluster CSV: {csv_path}", flush=True)
 
         share_dir: Optional[Path] = None
+        share_summary: Optional[dict] = None
         if share_package:
             share_dir = output_path / "share"
             if verbose:
                 print(f"Building share package: {share_dir}", flush=True)
-            build_share_package(csv_path=csv_path, out_dir=share_dir)
+            share_summary = build_share_package(
+                csv_path=csv_path,
+                out_dir=share_dir,
+                drive_service=service if contact_sheets_folder_id else None,
+                drive_folder_id=contact_sheets_folder_id,
+                subfolder_name=contact_sheets_subfolder_name,
+                cleanup_old_subfolders=cleanup_old_subfolders,
+                verbose=verbose,
+            )
 
         writeback_count = 0
         if write_drive_descriptions:
@@ -207,6 +249,7 @@ class MediaTaggingPipeline:
             "csv_path": str(csv_path),
             "output_dir": str(output_path),
             "share_dir": str(share_dir) if share_dir is not None else None,
+            "share_upload": (share_summary or {}).get("upload"),
         }
 
     def writeback_from_csv(self, csv_path: str) -> dict:
@@ -415,6 +458,32 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Skip building the shareable review package under <output_dir>/share/",
     )
+    parser.add_argument(
+        "--contact-sheets-drive-folder-id",
+        help=(
+            "Google Drive folder ID (or URL) that will receive uploaded "
+            "contact-sheet JPEGs. When set, the summary CSV's contact_sheet "
+            "column carries Drive URLs; when unset, it carries local relative "
+            "paths."
+        ),
+    )
+    parser.add_argument(
+        "--contact-sheets-subfolder-name",
+        help=(
+            "Custom name for the new subfolder created inside the configured "
+            "Drive folder. When unset an auto-timestamped name "
+            "(contact_sheets_YYYY-MM-DD_HHMMSS, UTC) is used."
+        ),
+    )
+    parser.add_argument(
+        "--cleanup-old-subfolders",
+        action="store_true",
+        help=(
+            "Before uploading, delete every auto-timestamped subfolder "
+            "(matching contact_sheets_YYYY-MM-DD_HHMMSS) under the configured "
+            "Drive folder. Custom-named subfolders are preserved."
+        ),
+    )
     return parser
 
 
@@ -454,6 +523,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         write_drive_descriptions=args.write_drive_descriptions,
         recursive=args.recursive,
         share_package=not args.no_share_package,
+        contact_sheets_drive_folder_id=args.contact_sheets_drive_folder_id,
+        contact_sheets_subfolder_name=args.contact_sheets_subfolder_name,
+        cleanup_old_subfolders=args.cleanup_old_subfolders,
     )
 
     print(f"Processed media files: {summary['media_count']}")
@@ -463,6 +535,19 @@ def main(argv: Optional[list[str]] = None) -> int:
     print(f"CSV: {summary['csv_path']}")
     if summary.get("share_dir"):
         print(f"Share package: {summary['share_dir']}")
+    upload = summary.get("share_upload")
+    if upload:
+        print(
+            f"Contact sheets uploaded: {upload['uploaded']}/{upload['expected']} "
+            f"(Drive subfolder: {upload['subfolder_name']})"
+        )
+        if upload.get("fallback_to_local"):
+            print(
+                "Clusters with local-path fallback: "
+                f"{upload['fallback_to_local']}"
+            )
+        if upload.get("cleanup_deleted"):
+            print(f"Cleanup deleted: {upload['cleanup_deleted']}")
     return 0
 
 

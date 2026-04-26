@@ -82,6 +82,44 @@ By default the pipeline also builds a shareable review package alongside the
 raw CSV (suitable for the spreadsheet import buttons). To skip it, pass
 `--no-share-package`.
 
+#### Optional: upload contact sheets to Google Drive
+
+When you want the summary CSV to carry direct image URLs (so a Google Sheet
+can render them with `=IMAGE("<url>")` without filesystem assumptions), point
+the pipeline at a Drive folder it can write into:
+
+```bash
+python -m unlabeled_media_tagger "https://drive.google.com/drive/folders/YOUR_FOLDER_ID" \
+  --output-dir outputs/pipeline \
+  --recursive \
+  --contact-sheets-drive-folder-id "https://drive.google.com/drive/folders/SCRATCH_FOLDER_ID" \
+  --cleanup-old-subfolders
+```
+
+What this changes:
+
+- Each run uploads its contact-sheet JPEGs into a *new subfolder* of the
+  configured target. Subfolder name defaults to
+  `contact_sheets_YYYY-MM-DD_HHMMSS` (UTC); override with
+  `--contact-sheets-subfolder-name <name>`. The subfolder must not already
+  exist — name collisions error out.
+- `face_clusters_summary.csv`'s existing `contact_sheet` column now contains
+  full Drive URLs of the form
+  `https://drive.google.com/uc?export=view&id=<FILE_ID>` instead of the
+  relative path. Schema, columns, and column order are unchanged.
+- Local `share/contact_sheets/*.jpg` files are still written exactly as
+  before, and `index.html` still references the local files (it remains a
+  standalone offline companion to the local directory).
+- `--cleanup-old-subfolders` deletes every subfolder under the target whose
+  name matches the auto-timestamped pattern *before* the new upload runs.
+  Custom-named subfolders are never touched. The flag must be re-passed on
+  each run; there is no auto-cleanup mode.
+- On startup, if a folder ID is configured the pipeline verifies the
+  authenticated user can write to it before any media is downloaded — a
+  misconfigured folder fails fast.
+- Without `--contact-sheets-drive-folder-id` the behavior is unchanged from
+  earlier slices: relative paths in the CSV, no Drive uploads.
+
 #### Pipeline outputs
 
 Files written under `<output-dir>` (default `outputs/pipeline/`) that other
