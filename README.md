@@ -97,8 +97,7 @@ outputs/pipeline/share/README_results.md                 # human-readable run su
 ```
 
 The `share/` folder is regenerated on every pipeline run. To re-run the
-share-package generator against an existing CSV without re-processing media
-(for example after tweaking contact-sheet options):
+share-package generator against an existing CSV without re-processing media:
 
 ```bash
 python scripts/build_share_package.py \

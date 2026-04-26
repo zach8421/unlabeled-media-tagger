@@ -5,12 +5,11 @@ from __future__ import annotations
 import csv
 import html
 import json
-import math
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageOps
+from PIL import Image
 
 
 SHARED_COLUMNS = [
@@ -90,16 +89,6 @@ def write_summary_csv(summaries: list[dict], out_path: Path) -> None:
         writer.writerows(summaries)
 
 
-def pick_representative_rows(rows: list[dict], max_rows: int) -> list[dict]:
-    def score(row: dict) -> tuple[float, float]:
-        return (
-            parse_float(row.get("similarity_to_cluster"), default=0.0),
-            parse_float(row.get("confidence"), default=0.0),
-        )
-
-    return sorted(rows, key=score, reverse=True)[:max_rows]
-
-
 def parse_float(value, default: float = 0.0) -> float:
     try:
         return float(value)
@@ -114,7 +103,43 @@ def parse_int(value, default: int = 0) -> int:
         return default
 
 
-def crop_face(row: dict, tile_size: int) -> Image.Image | None:
+def select_representative_face(cluster_rows: list[dict]) -> dict | None:
+    """Pick the single most representative face row for a cluster.
+
+    Ordering:
+      1. ``similarity_to_cluster`` descending (closest to cluster centroid).
+      2. Face area ``bbox_w * bbox_h`` descending (larger, typically clearer).
+      3. ``frame_index`` ascending (deterministic final tiebreaker).
+
+    Returns ``None`` if ``cluster_rows`` is empty.
+    """
+    if not cluster_rows:
+        return None
+
+    def sort_key(row: dict) -> tuple[float, int, int]:
+        similarity = parse_float(row.get("similarity_to_cluster"), default=0.0)
+        area = parse_int(row.get("bbox_w")) * parse_int(row.get("bbox_h"))
+        frame_index = parse_int(row.get("frame_index"), default=0)
+        return (-similarity, -area, frame_index)
+
+    return min(cluster_rows, key=sort_key)
+
+
+def crop_face_from_row(
+    row: dict,
+    margin: float = 0.25,
+    max_dim: int = 512,
+) -> Image.Image | None:
+    """Open ``frame_path`` and return a single cropped face.
+
+    The crop covers the bbox plus ``margin`` (fraction of the bbox's larger
+    side) on each edge, clamped to image bounds. The natural aspect ratio is
+    preserved. If the larger output side exceeds ``max_dim`` it is downscaled
+    with Lanczos resampling; smaller crops are saved at native resolution
+    (no upscaling).
+
+    Returns ``None`` if the frame is missing/unreadable or the bbox is invalid.
+    """
     frame_path = row.get("frame_path", "")
     if not frame_path:
         return None
@@ -135,59 +160,44 @@ def crop_face(row: dict, tile_size: int) -> Image.Image | None:
     if w <= 0 or h <= 0:
         return None
 
-    margin = int(max(w, h) * 0.25)
-    left = max(0, x - margin)
-    top = max(0, y - margin)
-    right = min(image.width, x + w + margin)
-    bottom = min(image.height, y + h + margin)
+    pad = int(round(max(w, h) * margin))
+    left = max(0, x - pad)
+    top = max(0, y - pad)
+    right = min(image.width, x + w + pad)
+    bottom = min(image.height, y + h + pad)
     if right <= left or bottom <= top:
         return None
 
     crop = image.crop((left, top, right, bottom))
-    crop = ImageOps.pad(crop, (tile_size, tile_size), color=(245, 245, 245))
+
+    longest = max(crop.width, crop.height)
+    if longest > max_dim:
+        scale = max_dim / longest
+        new_size = (
+            max(1, int(round(crop.width * scale))),
+            max(1, int(round(crop.height * scale))),
+        )
+        crop = crop.resize(new_size, Image.LANCZOS)
+
     return crop
 
 
-def build_contact_sheet(
-    cluster_label: str,
-    rows: list[dict],
-    out_path: Path,
-    max_faces: int,
-    tile_size: int,
-    cols: int,
-) -> bool:
-    selected = pick_representative_rows(rows, max_faces)
-    tiles = []
-    for row in selected:
-        crop = crop_face(row, tile_size)
-        if crop is not None:
-            tiles.append(crop)
+def build_contact_sheet(rows: list[dict], out_path: Path) -> bool:
+    """Write a single representative face crop for a cluster to ``out_path``.
 
-    if not tiles:
+    Returns ``True`` if a JPEG was written, ``False`` if no usable face was
+    available (no rows, missing/unreadable frame, or invalid bbox).
+    """
+    representative = select_representative_face(rows)
+    if representative is None:
         return False
 
-    header_height = 48
-    gap = 8
-    rows_count = math.ceil(len(tiles) / cols)
-    width = (cols * tile_size) + ((cols + 1) * gap)
-    height = header_height + (rows_count * tile_size) + ((rows_count + 1) * gap)
-    sheet = Image.new("RGB", (width, height), "white")
-    draw = ImageDraw.Draw(sheet)
-    draw.text(
-        (gap, 14),
-        f"{cluster_label} | faces: {len(rows)} | examples shown: {len(tiles)}",
-        fill=(20, 20, 20),
-    )
-
-    for index, tile in enumerate(tiles):
-        col = index % cols
-        row = index // cols
-        x = gap + col * (tile_size + gap)
-        y = header_height + gap + row * (tile_size + gap)
-        sheet.paste(tile, (x, y))
+    crop = crop_face_from_row(representative)
+    if crop is None:
+        return False
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    sheet.save(out_path, quality=90)
+    crop.save(out_path, "JPEG", quality=90)
     return True
 
 
@@ -327,9 +337,6 @@ def write_index(out_dir: Path, summaries: list[dict], metadata: dict | None = No
 def build_share_package(
     csv_path: Path,
     out_dir: Path,
-    max_faces_per_cluster: int = 48,
-    tile_size: int = 128,
-    cols: int = 8,
     metadata: dict | None = None,
 ) -> dict:
     """Build a shareable review package and return summary counts."""
@@ -343,12 +350,8 @@ def build_share_package(
 
     for cluster_label, cluster_faces in grouped.items():
         build_contact_sheet(
-            cluster_label=cluster_label,
             rows=cluster_faces,
             out_path=contact_dir / f"{cluster_label}.jpg",
-            max_faces=max_faces_per_cluster,
-            tile_size=tile_size,
-            cols=cols,
         )
 
     summaries = summarize_clusters(grouped, "contact_sheets")

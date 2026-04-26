@@ -54,24 +54,6 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Allow one cluster to contain multiple faces from the same frame",
     )
-    parser.add_argument(
-        "--max-faces-per-cluster",
-        type=int,
-        default=48,
-        help="Maximum face crops to include in each contact sheet",
-    )
-    parser.add_argument(
-        "--tile-size",
-        type=int,
-        default=128,
-        help="Face crop tile size in contact sheets",
-    )
-    parser.add_argument(
-        "--cols",
-        type=int,
-        default=8,
-        help="Number of columns in contact sheets",
-    )
     return parser.parse_args()
 
 
@@ -110,11 +92,6 @@ def write_manifest(
             "merge_min_similarity": args.merge_min_similarity,
             "merge_mean_similarity": args.merge_mean_similarity,
             "prevent_same_frame_merge": not args.allow_same_frame_merge,
-        },
-        "review_package": {
-            "max_faces_per_cluster": args.max_faces_per_cluster,
-            "tile_size": args.tile_size,
-            "cols": args.cols,
         },
         "outputs": {
             "clusters": cluster_count,
@@ -157,9 +134,6 @@ def main() -> int:
     summary = build_share_package(
         csv_path=csv_path,
         out_dir=out_dir,
-        max_faces_per_cluster=args.max_faces_per_cluster,
-        tile_size=args.tile_size,
-        cols=args.cols,
         metadata=manifest,
     )
 
