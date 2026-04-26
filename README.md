@@ -78,10 +78,32 @@ python -m unlabeled_media_tagger "https://drive.google.com/drive/folders/YOUR_FO
   --recursive
 ```
 
-The output CSV is written to:
+By default the pipeline also builds a shareable review package alongside the
+raw CSV (suitable for the spreadsheet import buttons). To skip it, pass
+`--no-share-package`.
+
+#### Pipeline outputs
+
+Files written under `<output-dir>` (default `outputs/pipeline/`) that other
+tools consume:
 
 ```text
-outputs/pipeline/face_clusters.csv
+outputs/pipeline/face_clusters.csv                       # raw face-level results (full schema, includes local frame paths)
+outputs/pipeline/share/face_clusters_share.csv           # cleaned face-level results consumed by the spreadsheet
+outputs/pipeline/share/face_clusters_summary.csv         # one row per cluster (counts + contact-sheet paths)
+outputs/pipeline/share/contact_sheets/<cluster>.jpg      # one contact sheet per cluster
+outputs/pipeline/share/index.html                        # browser-friendly summary view
+outputs/pipeline/share/README_results.md                 # human-readable run summary
+```
+
+The `share/` folder is regenerated on every pipeline run. To re-run the
+share-package generator against an existing CSV without re-processing media
+(for example after tweaking contact-sheet options):
+
+```bash
+python scripts/build_share_package.py \
+  --csv outputs/pipeline/face_clusters.csv \
+  --out-dir outputs/pipeline/share
 ```
 
 To also write compact clustering metadata back to each Google Drive file description:
@@ -170,6 +192,7 @@ Useful options:
 --detector-backend retinaface # DeepFace detector backend
 --model-name ArcFace          # DeepFace embedding model
 --no-processing-cache         # Reprocess files even if cached face records exist
+--no-share-package            # Skip building the shareable review package under <output-dir>/share/
 ```
 
 Processed face records are cached per Drive file under `outputs/pipeline/processed/`.

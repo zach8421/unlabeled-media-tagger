@@ -16,6 +16,7 @@ from unlabeled_media_tagger.pipeline.detect import DetectStage
 from unlabeled_media_tagger.pipeline.enrich import EnrichStage, build_drive_metadata
 from unlabeled_media_tagger.pipeline.extract import ExtractStage
 from unlabeled_media_tagger.pipeline.fetch import FetchStage
+from unlabeled_media_tagger.pipeline.share_package import build_share_package
 
 
 CSV_FIELDS = [
@@ -68,6 +69,7 @@ class MediaTaggingPipeline:
         limit: Optional[int] = None,
         write_drive_descriptions: bool = False,
         recursive: bool = False,
+        share_package: bool = True,
     ) -> dict:
         """
         Run the full media tagging pipeline.
@@ -78,6 +80,8 @@ class MediaTaggingPipeline:
             limit: Optional maximum number of Drive media files to process.
             write_drive_descriptions: Whether to update Drive file descriptions.
             recursive: Whether to walk nested Drive folders.
+            share_package: Whether to build the share package under
+                ``<output_dir>/share/`` after writing the cluster CSV.
 
         Returns:
             Summary dictionary with output paths and counts.
@@ -165,6 +169,13 @@ class MediaTaggingPipeline:
         if verbose:
             print(f"Wrote cluster CSV: {csv_path}", flush=True)
 
+        share_dir: Optional[Path] = None
+        if share_package:
+            share_dir = output_path / "share"
+            if verbose:
+                print(f"Building share package: {share_dir}", flush=True)
+            build_share_package(csv_path=csv_path, out_dir=share_dir)
+
         writeback_count = 0
         if write_drive_descriptions:
             if verbose:
@@ -195,6 +206,7 @@ class MediaTaggingPipeline:
             "writeback_count": writeback_count,
             "csv_path": str(csv_path),
             "output_dir": str(output_path),
+            "share_dir": str(share_dir) if share_dir is not None else None,
         }
 
     def writeback_from_csv(self, csv_path: str) -> dict:
@@ -398,6 +410,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Reprocess media files even if cached face records exist",
     )
+    parser.add_argument(
+        "--no-share-package",
+        action="store_true",
+        help="Skip building the shareable review package under <output_dir>/share/",
+    )
     return parser
 
 
@@ -436,6 +453,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         limit=args.limit,
         write_drive_descriptions=args.write_drive_descriptions,
         recursive=args.recursive,
+        share_package=not args.no_share_package,
     )
 
     print(f"Processed media files: {summary['media_count']}")
@@ -443,6 +461,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     print(f"Clusters: {summary['cluster_count']}")
     print(f"Drive descriptions updated: {summary['writeback_count']}")
     print(f"CSV: {summary['csv_path']}")
+    if summary.get("share_dir"):
+        print(f"Share package: {summary['share_dir']}")
     return 0
 
 
