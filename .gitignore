@@ -228,3 +228,5 @@ examples/Usability Test/
 examples/writeback_starter_package/
 examples/writeback_starter_package*.zip
 examples/*.xlsx
+.claude/
+PIPELINE_SLICE_*.md
