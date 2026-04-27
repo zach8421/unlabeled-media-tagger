@@ -1,12 +1,21 @@
-# Project status — slice 3 complete
+# Project status — slice 4 complete
 
 ## Current state
 
-- Slices 1-3 shipped to main. Pipeline auto-generates share package,
-  produces single-face crops per cluster, uploads them to Drive, and
-  writes Drive URLs into face_clusters_summary.csv's contact_sheet column.
+- Slices 1-4 shipped to main. Pipeline auto-generates share package,
+  produces single-face crops per cluster, uploads them to Drive, writes
+  Drive URLs into face_clusters_summary.csv's contact_sheet column, and
+  auto-uploads face_clusters_summary.csv and face_clusters_share.csv to
+  the configured Drive folder.
 - Validated end-to-end at scale: 180 files → 5888 faces → 530 clusters →
   530 Drive uploads → 530 IMAGE() formulas rendering in spreadsheet.
+- Slice 4 shipped. CSV uploads update in place by name so file IDs stay
+  stable across runs. face_clusters.csv (raw, with local paths) stays
+  local. Pipeline exits non-zero on CSV upload failure so automation can
+  detect broken runs.
+- Slice 4 validated end-to-end against real Drive: ID stability,
+  mimeType correctness, duplicate-name error handling, and exit code
+  propagation all pass. No CSV upload still required for the user test.
 - Spreadsheet (Shivang's UI) lives in slice3_dev_target/ in team Drive
   (moved out of Converge's 10GB folder due to recursive-scan pickup).
 - Team's Apps Script script updated for slice 3: syncFaceLibraryFromSummaryCSV
