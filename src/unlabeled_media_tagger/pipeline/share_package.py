@@ -17,12 +17,14 @@ from unlabeled_media_tagger.drive.files import (
     delete_folder,
     list_subfolders,
     upload_file,
+    upload_file_overwriting_by_name,
 )
 
 
 CONTACT_SHEET_DIR_NAME = "contact_sheets"
 DRIVE_URL_TEMPLATE = "https://drive.google.com/uc?export=view&id={file_id}"
 AUTO_SUBFOLDER_PATTERN = re.compile(r"^contact_sheets_\d{4}-\d{2}-\d{2}_\d{6}$")
+SHARE_CSV_FILENAMES = ("face_clusters_summary.csv", "face_clusters_share.csv")
 
 
 SHARED_COLUMNS = [
@@ -477,6 +479,50 @@ def upload_contact_sheets(
     return url_by_label
 
 
+def upload_share_csvs(
+    service,
+    parent_folder_id: str,
+    share_dir: Path,
+    verbose: bool = False,
+) -> dict:
+    """Upload the two share-package CSVs to the configured Drive folder.
+
+    Each CSV is uploaded with overwrite-by-name semantics so file IDs stay
+    stable across runs. A failure on one CSV does not abort the other --
+    partial state is surfaced via the ``failed`` list rather than raised, so
+    the pipeline doesn't die at the very last step over a single CSV upload
+    error.
+
+    ``face_clusters.csv`` (the raw output with local filesystem paths) is
+    never uploaded.
+    """
+    uploaded: list[dict] = []
+    failed: list[dict] = []
+    for filename in SHARE_CSV_FILENAMES:
+        local_path = share_dir / filename
+        try:
+            file_id = upload_file_overwriting_by_name(
+                service,
+                str(local_path),
+                parent_folder_id,
+                drive_filename=filename,
+                mime_type="text/csv",
+            )
+        except Exception as exc:
+            print(
+                f"  CSV upload failed for {filename}: {exc} -- "
+                "local copy is still on disk; upload manually if needed.",
+                flush=True,
+            )
+            failed.append({"name": filename, "error": str(exc)})
+            continue
+        uploaded.append({"name": filename, "file_id": file_id})
+        if verbose:
+            url = f"https://drive.google.com/file/d/{file_id}/view"
+            print(f"  CSV uploaded: {filename} -> {url}", flush=True)
+    return {"uploaded": uploaded, "failed": failed}
+
+
 def build_share_package(
     csv_path: Path,
     out_dir: Path,
@@ -573,6 +619,26 @@ def build_share_package(
         url_by_label=url_by_label,
     )
     write_summary_csv(summaries, out_dir / "face_clusters_summary.csv")
+
+    if uploads_enabled:
+        if verbose:
+            print(
+                "Uploading share-package CSVs (overwrite-by-name)...",
+                flush=True,
+            )
+        upload_summary["csv_upload"] = upload_share_csvs(
+            drive_service,
+            drive_folder_id,
+            out_dir,
+            verbose=verbose,
+        )
+    elif drive_folder_id is None and drive_service is None:
+        if verbose:
+            print(
+                "Drive uploads not configured -- share-package CSVs stay local.",
+                flush=True,
+            )
+
     write_readme(out_dir, csv_path, summaries, metadata=metadata)
     write_index(out_dir, summaries, CONTACT_SHEET_DIR_NAME, metadata=metadata)
 

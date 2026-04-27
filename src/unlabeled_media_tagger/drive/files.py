@@ -190,6 +190,110 @@ def upload_file(
     return created["id"]
 
 
+def upload_file_overwriting_by_name(
+    service,
+    local_path: str,
+    parent_folder_id: str,
+    drive_filename: str,
+    mime_type: str,
+) -> str:
+    """
+    Upload a local file to a Drive folder, overwriting any existing non-folder
+    file with the same name (preserving its file ID).
+
+    Lookup uses an exact ``name`` match against children of
+    ``parent_folder_id``, excluding folder-typed entries so a folder named
+    like the file is never clobbered. With 0 matches a new file is created;
+    with 1 the existing file's content is replaced via ``files.update`` (file
+    ID preserved); with 2+ matches the helper raises rather than guess which
+    file to overwrite. After upload, the resulting file's ``mimeType`` is
+    verified against ``mime_type`` -- mismatch raises (catches Drive
+    auto-conversion such as CSV -> Sheets).
+
+    Args:
+        service: Authenticated Google Drive service.
+        local_path: Path to the local file to upload.
+        parent_folder_id: Drive folder ID to upload into / look up under.
+        drive_filename: Exact name to match in Drive (also used when creating).
+        mime_type: MIME type for the uploaded media (e.g. ``text/csv``).
+
+    Returns:
+        Drive file ID of the uploaded file (stable across update-in-place).
+    """
+    try:
+        from googleapiclient.http import MediaFileUpload
+    except ImportError as exc:
+        raise ImportError(
+            "Google Drive dependencies are not installed. Install the package "
+            "with runtime dependencies or run: pip install -r requirements.txt"
+        ) from exc
+
+    escaped_name = drive_filename.replace("'", "\\'")
+    query = (
+        f"'{parent_folder_id}' in parents "
+        f"and name = '{escaped_name}' "
+        f"and mimeType != '{FOLDER_MIME_TYPE}' "
+        "and trashed=false"
+    )
+
+    matches: list[dict] = []
+    page_token = None
+    while True:
+        results = service.files().list(
+            q=query,
+            pageSize=100,
+            pageToken=page_token,
+            fields="nextPageToken,files(id,name,mimeType)",
+        ).execute()
+        matches.extend(results.get("files", []))
+        page_token = results.get("nextPageToken")
+        if not page_token:
+            break
+
+    if len(matches) > 1:
+        ids = ", ".join(repr(item["id"]) for item in matches)
+        raise RuntimeError(
+            f"Found {len(matches)} files named {drive_filename!r} under "
+            f"Drive folder {parent_folder_id!r} (ids: {ids}). Refusing to "
+            "guess which to overwrite -- clean up the duplicates manually "
+            "before re-running."
+        )
+
+    media = MediaFileUpload(
+        str(Path(local_path)), mimetype=mime_type, resumable=False
+    )
+
+    if not matches:
+        created = service.files().create(
+            body={"name": drive_filename, "parents": [parent_folder_id]},
+            media_body=media,
+            fields="id",
+        ).execute()
+        file_id = created["id"]
+    else:
+        file_id = matches[0]["id"]
+        service.files().update(
+            fileId=file_id,
+            media_body=media,
+            fields="id",
+        ).execute()
+
+    metadata = service.files().get(
+        fileId=file_id,
+        fields="id,name,mimeType",
+    ).execute()
+    actual_mime = metadata.get("mimeType")
+    if actual_mime != mime_type:
+        raise RuntimeError(
+            f"Drive returned unexpected mimeType {actual_mime!r} for file "
+            f"{file_id!r} (name={metadata.get('name')!r}). Expected "
+            f"{mime_type!r}. Drive may have auto-converted the upload, which "
+            "would silently break downstream consumers."
+        )
+
+    return file_id
+
+
 def create_folder(service, name: str, parent_folder_id: str) -> str:
     """
     Create a folder inside a parent Drive folder.
