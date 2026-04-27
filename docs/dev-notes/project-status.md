@@ -1,4 +1,4 @@
-# Project status — slice 4 complete
+# Project status — slice 5 complete
 
 ## Current state
 
@@ -15,30 +15,63 @@
   detect broken runs.
 - Slice 4 validated end-to-end against real Drive: ID stability,
   mimeType correctness, duplicate-name error handling, and exit code
-  propagation all pass. No CSV upload still required for the user test.
+  propagation all pass.
+- Slice 5 shipped: end-user setup guide at docs/SETUP_FOR_USERS.md
+  covering Mac and Windows from empty laptop to first run, with Google
+  OAuth walkthrough (including the unverified-app warning bypass) and
+  known footguns inlined. Main README points to it for non-developer
+  audiences. Existing docs/SETUP.md flagged as outdated with a banner.
+- Cross-platform install validated on Windows: pipeline runs end-to-end
+  after pip-based install path against the api-test folder. tf-keras
+  was missing on the Windows pip path; added to requirements.txt.
 - Spreadsheet (Shivang's UI) lives in slice3_dev_target/ in team Drive
   (moved out of Converge's 10GB folder due to recursive-scan pickup).
-- Team's Apps Script script updated for slice 3: syncFaceLibraryFromSummaryCSV
-  reads URLs from CSV directly (no more searchFiles lookup).
-  updateFileDescriptions regex updated to handle uc?export=view&id= URL format.
-  fillDriveLinks and importFromCSV still have your-team-Drive folder IDs
-  hardcoded — not blocking but need updating before user test.
+- Team's Apps Script script updated for slice 3:
+  syncFaceLibraryFromSummaryCSV reads URLs from CSV directly (no more
+  searchFiles lookup). updateFileDescriptions regex updated to handle
+  uc?export=view&id= URL format. fillDriveLinks and importFromCSV still
+  have team-Drive folder IDs hardcoded — not blocking for the usability
+  test but need updating before broader Converge use.
 
 ## Architecture decisions worth remembering
 
-- Pipeline-first design: pipeline outputs are self-describing, scripts adapt
-  to consume cleaner outputs rather than pipeline accommodating script
-  conventions.
-- Caches are folder-keyed by Drive ID: outputs/pipeline/downloads/ (11GB)
-  and outputs/pipeline/processed/ (embedding JSONs) survive across runs.
+- Pipeline-first design: pipeline outputs are self-describing, scripts
+  adapt to consume cleaner outputs rather than pipeline accommodating
+  script conventions.
+- Caches are folder-keyed by Drive ID: outputs/pipeline/downloads/
+  (~11GB after a full run) and outputs/pipeline/processed/ (embedding
+  JSONs) survive across runs. Re-running with caches intact skips
+  download and embedding entirely; only clustering and uploads happen.
 - Slice 3 destination folder must be OUTSIDE the source media tree, or
   recursive scan picks up the pipeline's own outputs as input media.
+- requirements.txt does not pin tensorflow explicitly; DeepFace pulls
+  it transitively. Worth pinning later if a Windows install ever
+  surfaces a version conflict.
+- environment.yml is macOS-pinned (tensorflow-macos, dbus, etc.).
+  Windows install path is conda+pip rather than env-from-file.
+  Documented in SETUP_FOR_USERS.md but no separate environment-windows.yml
+  yet.
 
 ## What's outstanding
 
-[list of slice candidates, see below]
+Post-usability-test candidates, roughly in priority order:
+
+- Stale-cache invalidation. If Converge edits source files in place on
+  Drive, the pipeline's cache uses stale embeddings. Footgun worth
+  asking them about; may not be a real issue in their workflow.
+- Apps Script folder-ID cleanup for Converge Drive context.
+  fillDriveLinks and importFromCSV still hardcode team-Drive IDs.
+- Real cross-platform install story. Either a separate
+  environment-windows.yml or moving away from conda-pinned approach
+  toward requirements.txt + smaller conda base.
+- Begin feedback-loop work per docs/future-work/feedback-loop.md. The
+  largest planned workstream; should be informed by usability-test
+  observations rather than designed in advance.
 
 ## Reference
 
-- docs/future-work/feedback-loop.md — design notes for the human-in-the-loop
-  identity labeling system. Largest planned post-user-test workstream.
+- docs/future-work/feedback-loop.md — design notes for the
+  human-in-the-loop identity labeling system. Largest planned
+  post-user-test workstream.
+- docs/SETUP_FOR_USERS.md — end-user setup guide.
+- README.md — developer-audience documentation.
