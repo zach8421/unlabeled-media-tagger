@@ -548,7 +548,16 @@ def main(argv: Optional[list[str]] = None) -> int:
             )
         if upload.get("cleanup_deleted"):
             print(f"Cleanup deleted: {upload['cleanup_deleted']}")
-    return 0
+        csv_upload = upload.get("csv_upload")
+        if csv_upload:
+            for item in csv_upload.get("uploaded", []):
+                print(f"CSV uploaded: {item['name']} -> {item['file_id']}")
+            for item in csv_upload.get("failed", []):
+                print(f"CSV upload FAILED: {item['name']} ({item['error']})")
+    csv_upload_failed = bool(
+        ((upload or {}).get("csv_upload") or {}).get("failed")
+    )
+    return 1 if csv_upload_failed else 0
 
 
 if __name__ == "__main__":

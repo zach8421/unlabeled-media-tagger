@@ -110,6 +110,17 @@ What this changes:
 - Local `share/contact_sheets/*.jpg` files are still written exactly as
   before, and `index.html` still references the local files (it remains a
   standalone offline companion to the local directory).
+- `face_clusters_summary.csv` and `face_clusters_share.csv` are also
+  uploaded to the top level of the configured folder (alongside the
+  timestamped contact-sheet subfolders, not inside them), updated in
+  place on each run so their Drive file IDs stay stable across runs.
+  Apps Script or any other consumer can keep referencing the same file
+  IDs without reconfiguration. The raw `face_clusters.csv` (with local
+  filesystem paths) is never uploaded and stays local-only. If either
+  CSV upload fails (e.g. a duplicate-name conflict in the target folder
+  or an unexpected `mimeType` after upload), the other CSV is still
+  attempted, local files remain on disk, and the pipeline exits with a
+  non-zero status so automation can tell a clean run from a broken one.
 - `--cleanup-old-subfolders` deletes every subfolder under the target whose
   name matches the auto-timestamped pattern *before* the new upload runs.
   Custom-named subfolders are never touched. The flag must be re-passed on
