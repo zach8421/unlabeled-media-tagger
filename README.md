@@ -2,6 +2,8 @@
 
 A modular pipeline for enriching unlabeled photos and videos in Google Drive using open-source computer vision models. It can download media from a Google Drive folder, detect and embed faces with DeepFace, cluster similar faces, write a face-clustering CSV, and optionally write compact clustering metadata back to each Drive file description.
 
+> This README is written for developers comfortable with Python, conda, git, and Google Cloud Console. For step-by-step setup instructions aimed at end users, see [docs/SETUP_FOR_USERS.md](docs/SETUP_FOR_USERS.md).
+
 ## ✅ What Works Now
 
 - **Face Detection**: Detect faces in images using DeepFace (RetinaFace backend)
@@ -364,4 +366,11 @@ Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for gui
 
 ## 📚 Documentation
 
-Detailed documentation is coming soon in the `docs/` directory.
+Documentation lives in the `docs/` directory:
+
+- [docs/SETUP_FOR_USERS.md](docs/SETUP_FOR_USERS.md) — end-user setup guide (Windows + Mac, no Python background assumed)
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — pipeline architecture and stage design
+- [docs/API.md](docs/API.md) — API reference
+- [docs/SETUP.md](docs/SETUP.md) — older developer setup notes (superseded by this README; see banner in that file)
+- [docs/dev-notes/](docs/dev-notes/) — working notes from development
+- [docs/future-work/](docs/future-work/) — planned and in-progress work

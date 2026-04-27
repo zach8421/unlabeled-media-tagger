@@ -1,5 +1,7 @@
 # Setup Guide
 
+> **This document is outdated.** It pre-dates the conda-based install and the Google Drive / DeepFace integration, and may give instructions that no longer match the project. For developer setup, follow the [main README](../README.md) instead. For end-user setup with no Python background assumed, see [SETUP_FOR_USERS.md](SETUP_FOR_USERS.md).
+
 ## Prerequisites
 
 - Python 3.8 or higher
