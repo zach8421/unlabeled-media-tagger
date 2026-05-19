@@ -241,3 +241,6 @@ scratch/
 # Intentionally not committed; planning content stays local per the same
 # convention as .claude/, PIPELINE_SLICE_*.md, and results/.
 dev-log/
+
+# Reference PDFs (papers, prior art) kept local — too heavy for git history.
+research/
