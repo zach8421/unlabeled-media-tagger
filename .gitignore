@@ -233,3 +233,11 @@ PIPELINE_SLICE_*.md
 
 # Local Colab-run verification artifacts (downloaded copies of Drive content)
 results/
+
+# Local scratch: notebook copies pulled from Drive, throwaway one-off files
+scratch/
+
+# Local development journal — see CLAUDE.md and dev-log/README.md for format.
+# Intentionally not committed; planning content stays local per the same
+# convention as .claude/, PIPELINE_SLICE_*.md, and results/.
+dev-log/

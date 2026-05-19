@@ -101,20 +101,37 @@ IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff")
 
 # Faces with a clipped bbox side smaller than this are recorded with
 # status="skipped_small" and not written as crops. Matches the threshold used
-# by the main pipeline's embed_faces stage.
+# by the main pipeline's embed_faces stage. Detection-time guard, not the
+# quality-stage size filter (see MIN_CROP_DIM below).
 MIN_FACE_SIDE = 10
 
-# v1 status enum (asset_faces.csv `status` column):
-#   ok                          face detected, crop written
+# v1.1 quality gate (applied after the crop is written, in this order):
+#   1. MIN_CROP_DIM — crops whose short side is below this get
+#      status="filtered_small_crop" regardless of blur score. Defends against
+#      backdrop / collage faces whose halftone-print texture would otherwise
+#      score as sharp.
+#   2. BLUR_THRESHOLD — crops whose Laplacian-variance score is below this
+#      get status="filtered_blurry". Only checked once the crop passes the
+#      size gate.
+# Both defaults were tuned against real Converge debate photography on
+# 2026-05-18 (see dev-log). Crops are always written to disk regardless of
+# filter status so the decision is auditable and the threshold is tunable.
+BLUR_THRESHOLD = 45.0
+MIN_CROP_DIM = 100
+
+# v1.1 status enum (asset_faces.csv `status` column):
+#   ok                          face detected, crop written, passes quality gates
+#   filtered_small_crop         v1.1: crop short side < MIN_CROP_DIM
+#   filtered_blurry             v1.1: quality_score < BLUR_THRESHOLD
 #   no_faces                    DeepFace returned an empty list
-#   skipped_small               face detected but rejected (< MIN_FACE_SIDE)
+#   skipped_small               detection-time bbox rejected (< MIN_FACE_SIDE)
 #   skipped_already_processed   prior run already produced status=ok for this file
 #   read_error                  could not read the image bytes
 #   detect_error                DeepFace raised
 #
-# v1.1 will add `filtered_blurry` (and likely a `quality_score` column).
-# Any code branching on status MUST use an explicit allow-list, never an
-# equality check against "ok", so v1.1 statuses can be added additively.'''
+# Any code branching on status MUST use an explicit allow-list of acceptable
+# statuses, never an equality check against "ok". This lets future quality
+# statuses be added additively without breaking existing readers.'''
 
 CELL_06_HEADER_HELPERS = "## 3. Imports And Helpers"
 
@@ -167,6 +184,35 @@ def make_run_id() -> str:
 
 def is_image_name(name: str) -> bool:
     return name.lower().endswith(IMAGE_EXTENSIONS)
+
+
+def laplacian_variance(bgr) -> float:
+    """Variance of the Laplacian on the grayscale crop. Higher = sharper.
+
+    Mirrors src/unlabeled_media_tagger/preprocessing/blur.py:laplacian_variance
+    in the main repo. Copied (not imported) to keep this notebook standalone.
+    """
+    if bgr is None or bgr.size == 0:
+        return 0.0
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+
+def classify_quality(score: float, width: int, height: int,
+                     blur_threshold: float = BLUR_THRESHOLD,
+                     min_crop_dim: int = MIN_CROP_DIM) -> str:
+    """v1.1 filter: returns 'filtered_small_crop' / 'filtered_blurry' / 'ok'.
+
+    Size gate runs first because the Laplacian-variance score is unreliable
+    on small crops (halftone backdrop prints score high despite being out of
+    focus). Crops too small for the score to be trustworthy get attributed
+    to the size filter, not the blur filter.
+    """
+    if min(width, height) < min_crop_dim:
+        return "filtered_small_crop"
+    if score < blur_threshold:
+        return "filtered_blurry"
+    return "ok"
 
 
 # Folder name this notebook writes its own outputs into. Used to skip our own
@@ -258,6 +304,12 @@ def discover_folders_and_images(service, root_folder_id: str, recursive: bool):
                 if c.get("mimeType") != "application/vnd.google-apps.folder":
                     continue
                 if c.get("name") == NOTEBOOK_OUTPUT_FOLDER_NAME:
+                    parent_label = folder_path or "<root>"
+                    print(
+                        f"WARN: skipping subfolder named '{NOTEBOOK_OUTPUT_FOLDER_NAME}' "
+                        f"under {parent_label} — assumed to be a prior run's output tree. "
+                        f"Rename it if it's actually source media."
+                    )
                     continue
                 queue.append(c["id"])
     return folders
@@ -299,7 +351,7 @@ CELL_11_DETECT = '''ASSET_FACES_COLUMNS = [
     "source_file_name", "source_file_path", "source_file_id",
     "face_id", "face_index", "crop_file_name", "crop_path",
     "bbox_x", "bbox_y", "bbox_w", "bbox_h", "confidence",
-    "detector_backend", "processed_at", "status", "error",
+    "detector_backend", "processed_at", "status", "quality_score", "error",
 ]
 
 MANIFEST_COLUMNS = [
@@ -342,9 +394,24 @@ def choose_output_location(folder_path: str, folder_id: str, run_id: str):
         return fallback, True, None
 
 
+# Statuses that mean "we successfully ran detection on this source file" —
+# including v1.1 quality-filtered rows. read_error / detect_error are
+# deliberately excluded so transient failures get retried on the next run.
+PROCESSED_STATUSES = {
+    "ok",
+    "filtered_blurry",
+    "filtered_small_crop",
+    "no_faces",
+    "skipped_small",
+}
+
+
 def scan_existing_processed(folder_local_root) -> set:
-    """Return source_file_ids with a prior status=ok row under
-    <folder_local_root>/face_preprocessing/run_*/asset_faces.csv.
+    """Return source_file_ids that completed detection in a prior run.
+
+    Walks <folder_local_root>/face_preprocessing/run_*/asset_faces.csv and
+    collects every source_file_id whose row has any non-error status. Used
+    to skip those files on re-runs.
     """
     processed = set()
     if folder_local_root is None or not folder_local_root.exists():
@@ -359,7 +426,7 @@ def scan_existing_processed(folder_local_root) -> set:
         try:
             with csv_path.open(newline="") as fh:
                 for row in csv.DictReader(fh):
-                    if row.get("status") == "ok":
+                    if row.get("status") in PROCESSED_STATUSES:
                         sid = row.get("source_file_id", "")
                         if sid:
                             processed.add(sid)
@@ -402,6 +469,7 @@ def base_row(run_id, source_folder_id, source_folder_path, image, source_file_pa
         "detector_backend": DETECTOR_BACKEND,
         "processed_at": "",
         "status": "",
+        "quality_score": "",
         "error": "",
     }
 
@@ -563,7 +631,17 @@ for folder in folders_to_process:
                 )
                 face_row["crop_file_name"] = crop_file_name
                 face_row["crop_path"] = str(crop_path_full)
-                face_row["status"] = "ok"
+
+                # v1.1 quality gate: score on the written crop (so a later
+                # human re-tuning the threshold can re-score the same JPEGs),
+                # then classify. Status is one of:
+                # "ok" / "filtered_small_crop" / "filtered_blurry".
+                crop_h, crop_w = crop.shape[:2]
+                quality_score = laplacian_variance(crop)
+                face_row["quality_score"] = f"{quality_score:.4f}"
+                face_row["status"] = classify_quality(
+                    quality_score, crop_w, crop_h
+                )
                 rows.append(face_row)
                 faces_detected += 1
 
@@ -712,13 +790,16 @@ print(f"Unified manifest: {manifest_csv_path}")'''
 CELL_16_NOTES = """## Notes
 
 - **Re-running this notebook** on the same `SOURCE_FOLDER_URL` is safe and
-  cheap. Folders where *every* image already has a `status=ok` row from a
-  prior run are silently skipped — no new `face_preprocessing/run_<run_id>/`
-  is created for them, no CSV is written, and no manifest entry is appended.
-  Folders with at least one new file (or an error) get a fresh run subfolder
-  whose `asset_faces.csv` includes `skipped_already_processed` rows for the
-  unchanged files alongside `ok`/`no_faces`/error rows for the new ones.
-  The summary cell prints which folders were fully up-to-date.
+  cheap. Folders where every image already has a prior-run row with one of
+  the "processed" statuses (`ok`, `filtered_blurry`, `filtered_small_crop`,
+  `no_faces`, `skipped_small`) are silently skipped — no new
+  `face_preprocessing/run_<run_id>/` is created, no CSV is written, and no
+  manifest entry is appended. Folders with at least one new file (or with
+  prior `read_error` / `detect_error` rows that should be retried) get a
+  fresh run subfolder whose `asset_faces.csv` includes
+  `skipped_already_processed` rows for the unchanged files alongside fresh
+  rows for the new ones. The summary cell prints which folders were fully
+  up-to-date.
 - **Recursive discovery skips `face_preprocessing/`.** When `RECURSIVE=True`,
   the walker ignores any subfolder named `face_preprocessing` so prior runs'
   saved crops are not re-detected as fresh source images. Don't rename your
@@ -734,11 +815,19 @@ CELL_16_NOTES = """## Notes
   `output_folder_path` in the manifest.
 - **`face_id` is deterministic** — `<source_file_id>__face<face_index:02d>` —
   so the same face on the same file gets the same id across re-runs.
-- **Status values are an open string.** v1.1 will add `filtered_blurry` (and
-  likely a `quality_score` column). Don't write downstream code that branches
-  on `status == 'ok'`; always use an explicit allow-list of statuses.
-- **Out of scope for v1:** embeddings, clustering, alignment, identity
-  review, Drive metadata write-back, blur filtering, video frames."""
+- **v1.1 quality gate.** Every written crop is scored with Laplacian
+  variance (`quality_score` column) and classified by `classify_quality`:
+  short side < `MIN_CROP_DIM` → `filtered_small_crop`; otherwise score <
+  `BLUR_THRESHOLD` → `filtered_blurry`; else `ok`. Crops are written to disk
+  regardless of status so thresholds can be re-tuned later by re-scoring the
+  existing JPEGs — no need to re-run detection. To bypass either gate set
+  the corresponding threshold to 0 in the Configuration cell.
+- **Status values are an open string.** Don't write downstream code that
+  branches on `status == 'ok'`; always use an explicit allow-list. The
+  current set is documented in the Configuration cell.
+- **Out of scope for this notebook:** embeddings, clustering, alignment,
+  identity review, Drive metadata write-back, video frames. Those happen in
+  the local pipeline (or a future end-to-end Colab notebook)."""
 
 
 # ---------------------------------------------------------------------------
