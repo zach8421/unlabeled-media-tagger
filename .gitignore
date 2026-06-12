@@ -244,3 +244,9 @@ dev-log/
 
 # Reference PDFs (papers, prior art) kept local — too heavy for git history.
 research/
+
+# Capstone deliverable artifacts (IMT 526 class submission, not project code).
+Capstone Deliverable.pdf
+Capstone Deliverable*.txt
+Capstone Project Case Study.txt
+*Status Report.txt
