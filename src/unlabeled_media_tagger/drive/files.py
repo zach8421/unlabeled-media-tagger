@@ -74,7 +74,12 @@ def list_files_in_folder(
     return files
 
 
-def download_file(service, file_id: str, destination_path: str) -> str:
+def download_file(
+    service,
+    file_id: str,
+    destination_path: str,
+    supports_all_drives: bool = True,
+) -> str:
     """
     Download a Google Drive file to a local path.
 
@@ -82,6 +87,10 @@ def download_file(service, file_id: str, destination_path: str) -> str:
         service: Authenticated Google Drive service.
         file_id: Google Drive file ID.
         destination_path: Local output path.
+        supports_all_drives: Pass ``supportsAllDrives`` to the Drive API so
+            files that live on a Shared Drive resolve (without it the API
+            returns 404 for Shared-Drive items). Safe for My-Drive files too,
+            so it defaults on.
 
     Returns:
         Local destination path.
@@ -97,7 +106,9 @@ def download_file(service, file_id: str, destination_path: str) -> str:
     destination = Path(destination_path)
     destination.parent.mkdir(parents=True, exist_ok=True)
 
-    request = service.files().get_media(fileId=file_id)
+    request = service.files().get_media(
+        fileId=file_id, supportsAllDrives=supports_all_drives
+    )
     with destination.open("wb") as file_handle:
         downloader = MediaIoBaseDownload(file_handle, request)
         done = False
