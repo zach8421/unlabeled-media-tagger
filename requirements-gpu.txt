@@ -1,0 +1,33 @@
+# GPU pins — Linux / NVIDIA TITAN Xp (Pascal, compute capability 6.1)
+#
+# Apply ON TOP OF requirements.txt after the normal install:
+#   ./.venv/bin/pip install -r requirements.txt
+#   ./.venv/bin/pip install -r requirements-gpu.txt
+#
+# Why these exact versions (see dev-log/2026-06-11-gpu-enablement.md):
+#   - tensorflow[and-cuda] floats the CUDA stack UP past TF's tested build.
+#     On TF 2.21 that pulled CUDA 12.9 / cuDNN 9.23, which hits a TF 2.21
+#     dlopen regression AND drops Pascal/6.1 from cuDNN's support matrix.
+#   - Fix: TF 2.20.0 + CUDA 12.5 / cuDNN 9.3. cuDNN 9.3 still supports
+#     Pascal and needs only driver >=525.60.13 (box has 535.309.01).
+#   - Verified: both TITAN Xp register, a GPU matmul runs, and deepface
+#     (retinaface + ArcFace) detection runs on GPU (~93% util, ~3.2 GiB).
+#
+# Do NOT install `tensorflow[and-cuda]` — the `and-cuda` extra will float
+# these nvidia-*-cu12 wheels back up and break Pascal again. Pin instead.
+
+tensorflow==2.20.0
+tf-keras==2.20.1
+
+nvidia-cublas-cu12==12.5.3.2
+nvidia-cuda-cupti-cu12==12.5.82
+nvidia-cuda-nvcc-cu12==12.5.82
+nvidia-cuda-nvrtc-cu12==12.5.82
+nvidia-cuda-runtime-cu12==12.5.82
+nvidia-cudnn-cu12==9.3.0.75
+nvidia-cufft-cu12==11.2.3.61
+nvidia-curand-cu12==10.3.6.82
+nvidia-cusolver-cu12==11.6.3.83
+nvidia-cusparse-cu12==12.5.1.3
+nvidia-nvjitlink-cu12==12.5.82
+nvidia-nccl-cu12==2.27.7
