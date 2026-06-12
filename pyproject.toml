@@ -61,6 +61,9 @@ python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
 addopts = "-v --strict-markers"
+markers = [
+    "gpu: requires a CUDA-capable GPU; skipped when none is registered",
+]
 
 [tool.black]
 line-length = 88
