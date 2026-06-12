@@ -32,19 +32,24 @@ def code(text: str) -> nbf.NotebookNode:
 # Cell sources
 # ---------------------------------------------------------------------------
 
-CELL_01_TITLE = """# Face Preprocessing — Colab
+CELL_01_TITLE = """# Face Clustering Pipeline — Colab
 
-This notebook detects faces in every image inside a Google Drive folder and
-produces reusable preprocessing outputs:
+This notebook is the end-to-end face-clustering pipeline as a single Colab
+notebook. Point it at a Google Drive folder; it detects faces, embeds them
+with ArcFace, clusters them, and writes a share package back to Drive.
 
-- One JPEG crop per detected face (raw bbox crop, no alignment)
-- A per-folder `asset_faces.csv` listing every detected face
-- A per-run JSON manifest entry under `{PROJECT_ROOT}/preprocessing_manifest/`
-- A unified `preprocessing_manifest.csv` at `{PROJECT_ROOT}/preprocessing_manifest.csv`
-  composed from those JSONs
+Outputs per run:
 
-It does **not** compute embeddings, cluster faces, review identities, or write
-back to Drive metadata — those steps stay in the main pipeline.
+- One JPEG crop per detected face (raw bbox crop, no alignment), per-folder
+  `asset_faces.csv` and per-run manifest entries — same v1.1 preprocessing
+  artifacts as before.
+- `face_clusters.csv` at `{PROJECT_ROOT}/{SHARE_PACKAGE_DIR}/` with one row
+  per face and the same column shape as the local pipeline's output.
+- `face_clusters_share.csv` and `face_clusters_summary.csv` for downstream
+  spreadsheet consumers.
+- `contact_sheets/<cluster_label>.jpg` — one representative crop per cluster.
+- (optional) Drive upload of contact sheets + summary CSVs to a configured
+  Drive folder, with overwrite-by-name semantics for stable file IDs.
 
 **You only need to edit the Configuration cell (Cell 5).** Everything else
 runs as-is.
@@ -96,6 +101,24 @@ PROJECT_ROOT = "/content/drive/MyDrive/unlabeled-media-tagger"
 DETECTOR_BACKEND = "retinaface"
 RECURSIVE = True
 
+# End-to-end stage configuration. Matches the local pipeline's defaults so
+# notebook output is directly comparable to a local-pipeline run on the same
+# source folder.
+EMBEDDING_MODEL = "ArcFace"
+SIMILARITY_THRESHOLD = 0.68
+
+# Where the share package (face_clusters.csv, summary CSV, contact sheets)
+# is written on the Drive mount. Single location overwritten each run, so
+# downstream consumers (Apps Script) always point at the latest output.
+SHARE_PACKAGE_DIR = "share_package"
+
+# Optional. Set to a Drive folder URL/ID to upload contact sheets +
+# face_clusters_summary.csv + face_clusters_share.csv there. When set, the
+# summary CSV's `contact_sheet` column carries Drive URLs (IMAGE() ready);
+# when unset, it carries local relative paths and the share package only
+# exists on the Drive mount (still accessible, just no auto-upload step).
+CONTACT_SHEETS_DRIVE_FOLDER_URL = ""
+
 # Image extensions in scope for v1. Videos are out of scope.
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff")
 
@@ -139,18 +162,27 @@ CELL_07_HELPERS = '''import csv
 import json
 import logging
 import re
+import shutil
 import tempfile
+from collections import defaultdict
 from datetime import datetime, timezone
+from math import sqrt
 from pathlib import Path
 
 import cv2
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload
+from googleapiclient.errors import HttpError
+from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
+from PIL import Image
 from tqdm.auto import tqdm
 from deepface import DeepFace
 
 logging.getLogger("deepface").setLevel(logging.WARNING)
 logging.getLogger("tensorflow").setLevel(logging.ERROR)
+
+DRIVE_FOLDER_MIME_TYPE = "application/vnd.google-apps.folder"
+DRIVE_URL_TEMPLATE = "https://drive.google.com/uc?export=view&id={file_id}"
+AUTO_SUBFOLDER_PATTERN = re.compile(r"^contact_sheets_\\d{4}-\\d{2}-\\d{2}_\\d{6}$")
 
 
 _FOLDER_URL_RE = re.compile(r"/folders/([a-zA-Z0-9_-]+)")
@@ -213,6 +245,347 @@ def classify_quality(score: float, width: int, height: int,
     if score < blur_threshold:
         return "filtered_blurry"
     return "ok"
+
+
+# --- End-to-end pipeline helpers (embedding, clustering, share package) ----
+#
+# Mirrors src/unlabeled_media_tagger/preprocessing/{embed,cluster,share}.py
+# in the main repo. Copied (not imported) to keep this notebook standalone.
+# When updating either side, keep them aligned — equivalence with the local
+# pipeline depends on the cluster algorithm and embedding params matching.
+
+
+def embed_face_crop_bgr(bgr_crop, model_name=EMBEDDING_MODEL):
+    """ArcFace embedding for one BGR face crop. Returns None on failure.
+
+    Matches pipeline/embed_faces.py::embed_faces_in_image's represent() call
+    exactly: detector_backend="skip", enforce_detection=False, RGB input.
+    """
+    if bgr_crop is None or bgr_crop.size == 0:
+        return None
+    if bgr_crop.shape[0] < 10 or bgr_crop.shape[1] < 10:
+        return None
+    rgb_crop = cv2.cvtColor(bgr_crop, cv2.COLOR_BGR2RGB)
+    try:
+        result = DeepFace.represent(
+            img_path=rgb_crop,
+            model_name=model_name,
+            detector_backend="skip",
+            enforce_detection=False,
+        )
+    except Exception:
+        return None
+    if not isinstance(result, list) or len(result) == 0:
+        return None
+    embedding = result[0].get("embedding")
+    if not embedding:
+        return None
+    return [float(value) for value in embedding]
+
+
+def cosine_similarity(left, right):
+    if len(left) != len(right):
+        raise ValueError("Embedding vectors must have the same length")
+    dot = sum(float(a) * float(b) for a, b in zip(left, right))
+    left_norm = sqrt(sum(float(a) * float(a) for a in left))
+    right_norm = sqrt(sum(float(b) * float(b) for b in right))
+    if left_norm == 0 or right_norm == 0:
+        return 0.0
+    return dot / (left_norm * right_norm)
+
+
+def update_centroid(current_centroid, new_embedding, existing_count):
+    next_count = existing_count + 1
+    return [
+        ((float(current) * existing_count) + float(new)) / next_count
+        for current, new in zip(current_centroid, new_embedding)
+    ]
+
+
+def cluster_face_records(face_records, similarity_threshold=SIMILARITY_THRESHOLD):
+    """Online-centroid clustering — pure-function mirror of CompareStage."""
+    clustered = defaultdict(list)
+    centroids = []
+    for face in face_records:
+        embedding = face.get("embedding")
+        if not embedding:
+            continue
+        best_cluster = None
+        best_similarity = -1.0
+        for cluster_id, centroid in enumerate(centroids):
+            similarity = cosine_similarity(embedding, centroid)
+            if similarity > best_similarity:
+                best_similarity = similarity
+                best_cluster = cluster_id
+        if best_cluster is None or best_similarity < similarity_threshold:
+            cluster_id = len(centroids)
+            centroids.append([float(value) for value in embedding])
+            assigned_similarity = 1.0
+        else:
+            cluster_id = best_cluster
+            centroids[cluster_id] = update_centroid(
+                centroids[cluster_id],
+                embedding,
+                len(clustered[cluster_id]),
+            )
+            assigned_similarity = round(best_similarity, 6)
+        clustered[cluster_id].append(
+            {
+                **face,
+                "cluster_id": cluster_id,
+                "cluster_label": f"person_{cluster_id:03d}",
+                "similarity_to_cluster": assigned_similarity,
+            }
+        )
+    return dict(clustered)
+
+
+FACE_CLUSTERS_COLUMNS = [
+    "cluster_id", "cluster_label", "drive_id", "media_name", "media_path",
+    "frame_path", "timestamp_sec", "frame_index", "face_index",
+    "bbox_x", "bbox_y", "bbox_w", "bbox_h",
+    "confidence", "similarity_to_cluster", "model_name", "detector_backend",
+]
+SHARE_COLUMNS = [
+    "cluster_id", "cluster_label", "drive_id", "media_name",
+    "timestamp_sec", "frame_index", "face_index",
+    "bbox_x", "bbox_y", "bbox_w", "bbox_h",
+    "confidence", "similarity_to_cluster", "model_name", "detector_backend",
+]
+SUMMARY_COLUMNS = [
+    "cluster_id", "cluster_label", "face_count",
+    "media_file_count", "drive_file_count",
+    "example_media_names", "contact_sheet",
+]
+CONTACT_SHEET_DIR_NAME = "contact_sheets"
+
+
+def flatten_clusters_to_face_rows(clusters, model_name=EMBEDDING_MODEL,
+                                  detector_backend=DETECTOR_BACKEND):
+    """Convert cluster output to pipeline-schema face_clusters.csv rows.
+
+    Mapping notes (notebook → pipeline schema):
+      drive_id    <- source_file_id
+      media_name  <- source_file_name
+      frame_path  <- crop_path (the saved tight crop JPEG; the notebook does
+                     not keep the source photo on disk)
+      media_path / timestamp_sec / frame_index: empty (photo-only flow)
+    """
+    rows = []
+    for cluster_id in sorted(clusters):
+        for face in clusters[cluster_id]:
+            rows.append({
+                "cluster_id": face.get("cluster_id", cluster_id),
+                "cluster_label": face.get("cluster_label", f"person_{cluster_id:03d}"),
+                "drive_id": face.get("source_file_id", ""),
+                "media_name": face.get("source_file_name", ""),
+                "media_path": "",
+                "frame_path": face.get("crop_path", ""),
+                "timestamp_sec": "",
+                "frame_index": "",
+                "face_index": face.get("face_index", ""),
+                "bbox_x": face.get("bbox_x", ""),
+                "bbox_y": face.get("bbox_y", ""),
+                "bbox_w": face.get("bbox_w", ""),
+                "bbox_h": face.get("bbox_h", ""),
+                "confidence": face.get("confidence", ""),
+                "similarity_to_cluster": face.get("similarity_to_cluster", ""),
+                "model_name": model_name,
+                "detector_backend": detector_backend,
+            })
+    return rows
+
+
+def _parse_float(value, default=0.0):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _parse_int(value, default=0):
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def select_representative_face(cluster_rows):
+    if not cluster_rows:
+        return None
+    def sort_key(row):
+        similarity = _parse_float(row.get("similarity_to_cluster"), 0.0)
+        area = _parse_int(row.get("bbox_w")) * _parse_int(row.get("bbox_h"))
+        frame_index = _parse_int(row.get("frame_index"), 0)
+        return (-similarity, -area, frame_index)
+    return min(cluster_rows, key=sort_key)
+
+
+def group_rows_by_cluster(rows):
+    grouped = defaultdict(list)
+    for row in rows:
+        grouped[row.get("cluster_label", "unknown")].append(row)
+    return dict(sorted(grouped.items()))
+
+
+def summarize_clusters(grouped, contact_sheet_dir=CONTACT_SHEET_DIR_NAME,
+                       url_by_label=None):
+    url_by_label = url_by_label or {}
+    summaries = []
+    for cluster_label, rows in grouped.items():
+        media_names = sorted({r.get("media_name", "") for r in rows if r.get("media_name")})
+        drive_ids = sorted({r.get("drive_id", "") for r in rows if r.get("drive_id")})
+        cluster_id = rows[0].get("cluster_id", "") if rows else ""
+        contact_sheet_value = url_by_label.get(
+            cluster_label, f"{contact_sheet_dir}/{cluster_label}.jpg"
+        )
+        summaries.append({
+            "cluster_id": cluster_id,
+            "cluster_label": cluster_label,
+            "face_count": len(rows),
+            "media_file_count": len(media_names),
+            "drive_file_count": len(drive_ids),
+            "example_media_names": "; ".join(media_names[:5]),
+            "contact_sheet": contact_sheet_value,
+        })
+    return sorted(summaries, key=lambda item: int(item["face_count"]), reverse=True)
+
+
+def copy_crop_to_contact_sheet(src_crop_path, dest_path, max_dim=512):
+    """Resize the representative tight-crop JPEG to dest_path. Returns bool.
+
+    Notebook contact sheets are tight bbox crops (no margin) since source
+    photos aren't kept on disk. The pipeline's contact sheets use 25%-margin
+    re-crops from the source frame — documented divergence, visual difference
+    is small.
+    """
+    if not src_crop_path:
+        return False
+    path = Path(src_crop_path)
+    if not path.exists():
+        return False
+    try:
+        image = Image.open(path).convert("RGB")
+    except OSError:
+        return False
+    longest = max(image.width, image.height)
+    if longest > max_dim:
+        scale = max_dim / longest
+        new_size = (
+            max(1, int(round(image.width * scale))),
+            max(1, int(round(image.height * scale))),
+        )
+        image = image.resize(new_size, Image.LANCZOS)
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    image.save(dest_path, "JPEG", quality=90)
+    return True
+
+
+# --- Drive upload helpers (mirrors src/.../drive/files.py for self-containment) ---
+
+
+def drive_create_folder(service, name, parent_folder_id):
+    created = service.files().create(
+        body={"name": name, "mimeType": DRIVE_FOLDER_MIME_TYPE,
+              "parents": [parent_folder_id]},
+        fields="id",
+    ).execute()
+    return created["id"]
+
+
+def drive_upload_file(service, local_path, parent_folder_id, mime_type="image/jpeg"):
+    source = Path(local_path)
+    media = MediaFileUpload(str(source), mimetype=mime_type, resumable=False)
+    created = service.files().create(
+        body={"name": source.name, "parents": [parent_folder_id]},
+        media_body=media,
+        fields="id",
+    ).execute()
+    return created["id"]
+
+
+def drive_upload_file_overwriting_by_name(service, local_path, parent_folder_id,
+                                          drive_filename, mime_type):
+    escaped_name = drive_filename.replace("'", "\\\\'")
+    query = (f"'{parent_folder_id}' in parents and name = '{escaped_name}' "
+             f"and mimeType != '{DRIVE_FOLDER_MIME_TYPE}' and trashed=false")
+    matches = []
+    page_token = None
+    while True:
+        results = service.files().list(
+            q=query, pageSize=100, pageToken=page_token,
+            fields="nextPageToken,files(id,name,mimeType)",
+        ).execute()
+        matches.extend(results.get("files", []))
+        page_token = results.get("nextPageToken")
+        if not page_token:
+            break
+    if len(matches) > 1:
+        ids = ", ".join(repr(item["id"]) for item in matches)
+        raise RuntimeError(
+            f"Found {len(matches)} files named {drive_filename!r} under Drive "
+            f"folder {parent_folder_id!r} (ids: {ids}). Clean up duplicates."
+        )
+    media = MediaFileUpload(str(Path(local_path)), mimetype=mime_type, resumable=False)
+    if not matches:
+        created = service.files().create(
+            body={"name": drive_filename, "parents": [parent_folder_id]},
+            media_body=media, fields="id",
+        ).execute()
+        file_id = created["id"]
+    else:
+        file_id = matches[0]["id"]
+        service.files().update(
+            fileId=file_id, media_body=media, fields="id",
+        ).execute()
+    metadata = service.files().get(fileId=file_id, fields="id,name,mimeType").execute()
+    if metadata.get("mimeType") != mime_type:
+        raise RuntimeError(
+            f"Drive returned mimeType {metadata.get('mimeType')!r} for "
+            f"{file_id!r}; expected {mime_type!r}. Drive may have auto-converted."
+        )
+    return file_id
+
+
+def drive_list_subfolders(service, parent_folder_id):
+    query = (f"'{parent_folder_id}' in parents "
+             f"and mimeType='{DRIVE_FOLDER_MIME_TYPE}' and trashed=false")
+    folders = []
+    page_token = None
+    while True:
+        results = service.files().list(
+            q=query, pageSize=100, pageToken=page_token,
+            fields="nextPageToken,files(id,name)",
+        ).execute()
+        folders.extend(results.get("files", []))
+        page_token = results.get("nextPageToken")
+        if not page_token:
+            break
+    return folders
+
+
+def drive_verify_folder_writable(service, folder_id):
+    try:
+        meta = service.files().get(
+            fileId=folder_id,
+            fields="id,name,mimeType,capabilities/canAddChildren",
+        ).execute()
+    except HttpError as exc:
+        raise FileNotFoundError(f"Drive folder {folder_id!r} not accessible: {exc}") from exc
+    if meta.get("mimeType") != DRIVE_FOLDER_MIME_TYPE:
+        raise NotADirectoryError(
+            f"Drive ID {folder_id!r} is not a folder "
+            f"(name={meta.get('name', '?')!r}, mimeType={meta.get('mimeType', '?')!r})"
+        )
+    if not meta.get("capabilities", {}).get("canAddChildren"):
+        raise PermissionError(
+            f"Drive folder {folder_id!r} (name={meta.get('name', '?')!r}) is not writable"
+        )
+
+
+def generate_auto_subfolder_name(now=None):
+    moment = now or datetime.now(timezone.utc)
+    return moment.strftime("contact_sheets_%Y-%m-%d_%H%M%S")
 
 
 # Folder name this notebook writes its own outputs into. Used to skip our own
@@ -326,7 +699,7 @@ print(f"Discovered {len(folders_to_process)} folder(s), {total_images} image fil
 for f in folders_to_process:
     print(f"  {f['path'] or '<root>'} ({len(f['images'])} images)")'''
 
-CELL_10_HEADER_DETECT = """## 5. Detect Faces, Save Crops, Write Per-Folder CSV And Per-Run Manifest JSON
+CELL_10_HEADER_DETECT = """## 5. Detect Faces, Save Crops, Embed, Write Per-Folder CSV And Per-Run Manifest JSON
 
 Main processing loop. For each source folder:
 
@@ -340,7 +713,12 @@ Main processing loop. For each source folder:
    `status=skipped_already_processed`.
 3. Download each image via the Drive API, run `DeepFace.extract_faces`,
    crop each face from the BGR image with `cv2`, write JPEG quality 95.
-4. Write the folder's `asset_faces.csv` and a per-run manifest JSON under
+4. For every crop that passes the v1.1 quality gate (`status="ok"`),
+   compute an ArcFace embedding from the in-memory BGR crop. Embeddings live
+   in memory for this run and feed the clustering cell; they are not written
+   to disk this version (a future revision may add a sidecar JSONL so
+   re-clustering can happen without re-embedding).
+5. Write the folder's `asset_faces.csv` and a per-run manifest JSON under
    `{PROJECT_ROOT}/preprocessing_manifest/<run_id>__<source_folder_id>.json`.
 
 Per-image errors are caught and recorded in `status` + `error`. One bad image
@@ -479,6 +857,12 @@ print(f"run_id = {run_id}")
 
 manifest_entries = []
 skipped_folders = []
+
+# Accumulates face records across every folder processed this run. Only rows
+# that pass the v1.1 quality gate (status="ok") AND get a successful ArcFace
+# embedding land here — they feed the cluster cell. Embeddings live in memory
+# only this run; the per-folder asset_faces.csv schema is unchanged.
+all_face_records = []
 
 for folder in folders_to_process:
     folder_id = folder["id"]
@@ -642,6 +1026,17 @@ for folder in folders_to_process:
                 face_row["status"] = classify_quality(
                     quality_score, crop_w, crop_h
                 )
+
+                # Embed only quality-passing faces. Match pipeline's policy:
+                # represent() on the in-memory BGR crop (not the JPEG roundtrip)
+                # so the notebook's embeddings are bit-identical to the local
+                # pipeline's on the same input.
+                if face_row["status"] == "ok":
+                    embedding = embed_face_crop_bgr(crop, model_name=EMBEDDING_MODEL)
+                    if embedding is not None:
+                        face_row["embedding"] = embedding
+                        all_face_records.append(face_row)
+
                 rows.append(face_row)
                 faces_detected += 1
 
@@ -724,9 +1119,199 @@ for folder in folders_to_process:
 
 print(f"Folders with new work: {len(manifest_entries)}")
 if skipped_folders:
-    print(f"Folders fully up-to-date (no run subfolder created): {len(skipped_folders)}")'''
+    print(f"Folders fully up-to-date (no run subfolder created): {len(skipped_folders)}")
+print(f"Face records embedded and ready for clustering: {len(all_face_records)}")'''
 
-CELL_12_HEADER_COMPOSE = """## 6. Compose Unified Manifest CSV
+CELL_CLUSTER_HEADER = """## 6. Cluster Faces
+
+Runs online-centroid clustering over every face embedded this run. Matches
+the local pipeline's `CompareStage` algorithm (same default similarity
+threshold, same online-mean centroid update), so notebook clusters and
+pipeline clusters on the same input partition the faces equivalently.
+
+Emits `face_clusters.csv` at `{PROJECT_ROOT}/{SHARE_PACKAGE_DIR}/` with the
+same column schema as the local pipeline's `face_clusters.csv` — direct
+diff against a pipeline run is the verification path.
+
+Re-running this cell after the detect cell rebuilds the clustering from the
+in-memory `all_face_records`; re-running it on a fresh kernel does nothing
+useful since embeddings are not persisted (yet)."""
+
+CELL_CLUSTER = '''share_package_dir = Path(PROJECT_ROOT) / SHARE_PACKAGE_DIR
+share_package_dir.mkdir(parents=True, exist_ok=True)
+
+clusters = cluster_face_records(
+    all_face_records, similarity_threshold=SIMILARITY_THRESHOLD
+)
+face_cluster_rows = flatten_clusters_to_face_rows(
+    clusters,
+    model_name=EMBEDDING_MODEL,
+    detector_backend=DETECTOR_BACKEND,
+)
+
+face_clusters_csv_path = share_package_dir / "face_clusters.csv"
+with face_clusters_csv_path.open("w", newline="") as fh:
+    writer = csv.DictWriter(fh, fieldnames=FACE_CLUSTERS_COLUMNS)
+    writer.writeheader()
+    for row in face_cluster_rows:
+        writer.writerow({k: row.get(k, "") for k in FACE_CLUSTERS_COLUMNS})
+
+print(f"Faces clustered: {len(face_cluster_rows)}")
+print(f"Clusters formed: {len(clusters)}")
+print(f"face_clusters.csv: {face_clusters_csv_path}")'''
+
+CELL_SHARE_HEADER = """## 7. Build Share Package
+
+Writes the same share-package artifacts the local pipeline produces:
+
+- `face_clusters_share.csv` — face-level rows without local filesystem paths.
+- `face_clusters_summary.csv` — one row per cluster with counts and a
+  `contact_sheet` column. The column carries a local relative path here;
+  the upload cell (next) overwrites it with Drive URLs when configured.
+- `contact_sheets/<cluster_label>.jpg` — the representative tight bbox crop
+  for each cluster, resized to ≤512px on the long side.
+
+One known divergence from the pipeline: the pipeline re-crops the
+representative face from its source frame with a 25% margin. The notebook
+doesn't keep source images after detection, so its contact sheets are tight
+bbox crops without that margin. Visual difference is small."""
+
+CELL_SHARE = '''share_columns_present = SHARE_COLUMNS
+face_clusters_share_path = share_package_dir / "face_clusters_share.csv"
+with face_clusters_share_path.open("w", newline="") as fh:
+    writer = csv.DictWriter(fh, fieldnames=share_columns_present)
+    writer.writeheader()
+    for row in face_cluster_rows:
+        writer.writerow({k: row.get(k, "") for k in share_columns_present})
+
+grouped = group_rows_by_cluster(face_cluster_rows)
+contact_sheet_dir_local = share_package_dir / CONTACT_SHEET_DIR_NAME
+contact_sheet_dir_local.mkdir(parents=True, exist_ok=True)
+
+representative_paths = {}
+contact_sheets_written = 0
+contact_sheets_missing = []
+for cluster_label, cluster_rows in grouped.items():
+    rep = select_representative_face(cluster_rows)
+    if rep is None:
+        contact_sheets_missing.append(cluster_label)
+        continue
+    src_crop = rep.get("frame_path", "")
+    dest = contact_sheet_dir_local / f"{cluster_label}.jpg"
+    ok = copy_crop_to_contact_sheet(src_crop, dest, max_dim=512)
+    if ok:
+        representative_paths[cluster_label] = dest
+        contact_sheets_written += 1
+    else:
+        contact_sheets_missing.append(cluster_label)
+
+summaries = summarize_clusters(grouped, CONTACT_SHEET_DIR_NAME, url_by_label=None)
+face_clusters_summary_path = share_package_dir / "face_clusters_summary.csv"
+with face_clusters_summary_path.open("w", newline="") as fh:
+    writer = csv.DictWriter(fh, fieldnames=SUMMARY_COLUMNS)
+    writer.writeheader()
+    for row in summaries:
+        writer.writerow({k: row.get(k, "") for k in SUMMARY_COLUMNS})
+
+print(f"face_clusters_share.csv:   {face_clusters_share_path}")
+print(f"face_clusters_summary.csv: {face_clusters_summary_path}")
+print(f"contact_sheets/ written:   {contact_sheets_written}/{len(grouped)}")
+if contact_sheets_missing:
+    print(f"WARN clusters missing contact sheets: {contact_sheets_missing}")'''
+
+CELL_UPLOAD_HEADER = """## 8. (Optional) Upload Share Package To Drive
+
+When `CONTACT_SHEETS_DRIVE_FOLDER_URL` is set in the configuration cell, this
+cell:
+
+1. Creates a timestamped subfolder `contact_sheets_YYYY-MM-DD_HHMMSS` under
+   the configured Drive folder and uploads each per-cluster contact-sheet
+   JPEG into it.
+2. Rewrites `face_clusters_summary.csv` so its `contact_sheet` column
+   carries Drive URLs (`https://drive.google.com/uc?export=view&id=...`) in
+   place of local relative paths — that URL shape is what makes IMAGE()
+   formulas in Google Sheets render the image.
+3. Uploads `face_clusters_summary.csv` and `face_clusters_share.csv` to the
+   configured Drive folder with overwrite-by-name semantics (file IDs stay
+   stable across runs, so downstream consumers like the Apps Script don't
+   need to re-discover them).
+
+If the URL is left blank the cell is a no-op — the share package still
+exists locally under `{PROJECT_ROOT}/{SHARE_PACKAGE_DIR}/`."""
+
+CELL_UPLOAD = '''if CONTACT_SHEETS_DRIVE_FOLDER_URL:
+    contact_sheets_folder_id = parse_drive_folder_id(CONTACT_SHEETS_DRIVE_FOLDER_URL)
+    drive_verify_folder_writable(drive_service, contact_sheets_folder_id)
+
+    subfolder_name = generate_auto_subfolder_name()
+    existing_subs = drive_list_subfolders(drive_service, contact_sheets_folder_id)
+    if any(s["name"] == subfolder_name for s in existing_subs):
+        raise FileExistsError(
+            f"Subfolder {subfolder_name!r} already exists under "
+            f"{contact_sheets_folder_id!r}; re-run in a new second."
+        )
+    subfolder_id = drive_create_folder(drive_service, subfolder_name,
+                                       contact_sheets_folder_id)
+    print(f"Created Drive subfolder: {subfolder_name} (id={subfolder_id})")
+
+    url_by_label = {}
+    uploaded_count = 0
+    for cluster_label, local_path in representative_paths.items():
+        try:
+            file_id = drive_upload_file(
+                drive_service, str(local_path), subfolder_id,
+                mime_type="image/jpeg",
+            )
+        except Exception as exc:
+            print(f"  upload failed for {cluster_label}: {exc}")
+            continue
+        url_by_label[cluster_label] = DRIVE_URL_TEMPLATE.format(file_id=file_id)
+        uploaded_count += 1
+    print(f"Uploaded contact sheets: {uploaded_count}/{len(representative_paths)}")
+
+    # Rewrite face_clusters_summary.csv with Drive URLs in the contact_sheet
+    # column. face_clusters_share.csv has no contact_sheet column so it's
+    # uploaded as-is.
+    summaries_with_urls = summarize_clusters(
+        grouped, CONTACT_SHEET_DIR_NAME, url_by_label=url_by_label
+    )
+    with face_clusters_summary_path.open("w", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=SUMMARY_COLUMNS)
+        writer.writeheader()
+        for row in summaries_with_urls:
+            writer.writerow({k: row.get(k, "") for k in SUMMARY_COLUMNS})
+
+    csv_uploaded = []
+    csv_failed = []
+    for filename, mime_type in (
+        ("face_clusters_summary.csv", "text/csv"),
+        ("face_clusters_share.csv", "text/csv"),
+    ):
+        local_csv = share_package_dir / filename
+        try:
+            file_id = drive_upload_file_overwriting_by_name(
+                drive_service, str(local_csv),
+                contact_sheets_folder_id,
+                drive_filename=filename,
+                mime_type=mime_type,
+            )
+        except Exception as exc:
+            csv_failed.append((filename, exc))
+            continue
+        csv_uploaded.append((filename, file_id))
+        print(f"  CSV uploaded: {filename} -> {file_id}")
+    for filename, exc in csv_failed:
+        print(f"  CSV upload FAILED: {filename} ({exc})")
+    if csv_failed:
+        raise RuntimeError(
+            f"{len(csv_failed)} share-package CSV upload(s) failed. "
+            "Local copies are still on disk; upload manually if needed."
+        )
+else:
+    print("CONTACT_SHEETS_DRIVE_FOLDER_URL is empty -- skipping Drive upload.")
+    print(f"Share package available locally at: {share_package_dir}")'''
+
+CELL_12_HEADER_COMPOSE = """## 9. Compose Unified Manifest CSV
 
 Reads every JSON file under `{PROJECT_ROOT}/preprocessing_manifest/` (this run
 plus every prior run) and writes the unified CSV at
@@ -760,7 +1345,7 @@ CELL_13_COMPOSE = '''def compose_manifest_csv():
 manifest_csv_path, manifest_row_count = compose_manifest_csv()
 print(f"Wrote {manifest_csv_path} with {manifest_row_count} row(s).")'''
 
-CELL_14_HEADER_SUMMARY = "## 7. Summary"
+CELL_14_HEADER_SUMMARY = "## 10. Summary"
 
 CELL_15_SUMMARY = '''total_images_found = sum(e["images_found"] for e in manifest_entries)
 total_images_processed = sum(e["images_processed"] for e in manifest_entries)
@@ -772,6 +1357,8 @@ print(f"folders fully up-to-date (no run subfolder created): {len(skipped_folder
 print(f"images found (across folders with new work): {total_images_found}")
 print(f"images processed this run: {total_images_processed}")
 print(f"faces detected this run: {total_faces_detected}")
+print(f"faces embedded and clustered: {len(face_cluster_rows)}")
+print(f"clusters formed: {len(clusters)}")
 print()
 if manifest_entries:
     print("Per-folder outputs:")
@@ -785,7 +1372,12 @@ if skipped_folders:
         label = sf["folder_path"] or "<root>"
         print(f"  - {label} ({sf['files_already_processed']} files)")
     print()
-print(f"Unified manifest: {manifest_csv_path}")'''
+print(f"Share package:    {share_package_dir}")
+print(f"Unified manifest: {manifest_csv_path}")
+if CONTACT_SHEETS_DRIVE_FOLDER_URL:
+    print(f"Drive upload target: {CONTACT_SHEETS_DRIVE_FOLDER_URL}")
+else:
+    print("Drive upload: not configured (set CONTACT_SHEETS_DRIVE_FOLDER_URL to enable).")'''
 
 CELL_16_NOTES = """## Notes
 
@@ -825,9 +1417,32 @@ CELL_16_NOTES = """## Notes
 - **Status values are an open string.** Don't write downstream code that
   branches on `status == 'ok'`; always use an explicit allow-list. The
   current set is documented in the Configuration cell.
-- **Out of scope for this notebook:** embeddings, clustering, alignment,
-  identity review, Drive metadata write-back, video frames. Those happen in
-  the local pipeline (or a future end-to-end Colab notebook)."""
+- **End-to-end output is at `{PROJECT_ROOT}/{SHARE_PACKAGE_DIR}/`.** The
+  notebook writes the same artifacts as the local pipeline's share package:
+  `face_clusters.csv` (raw, with crop paths), `face_clusters_share.csv`
+  (cleaned, no local paths), `face_clusters_summary.csv` (one row per
+  cluster), and `contact_sheets/<cluster_label>.jpg`. Column shape matches
+  `pipeline/run.py::CSV_FIELDS` exactly, so diffing notebook output against
+  a local-pipeline run on the same source folder is the verification path.
+- **Embeddings live in memory only this run.** The cluster cell consumes the
+  in-memory `all_face_records` accumulator built by the detect cell.
+  Re-running the cluster cell after a fresh kernel start without re-running
+  detection does nothing useful. A future revision may persist embeddings as
+  a sidecar JSONL alongside `asset_faces.csv` to enable re-clustering and
+  threshold tuning without re-embedding.
+- **Contact sheets are tight bbox crops, not margined crops.** The local
+  pipeline's contact sheets re-crop from the source frame with a 25% margin.
+  The notebook only has the saved tight crop on disk (source photos are
+  deleted after detection), so it copies/resizes that JPEG directly.
+  Documented divergence; visual difference is small.
+- **Drive upload (optional).** Set `CONTACT_SHEETS_DRIVE_FOLDER_URL` in the
+  configuration cell to upload contact sheets + summary/share CSVs to a
+  separate Drive folder with overwrite-by-name semantics. The summary CSV's
+  `contact_sheet` column then carries Drive URLs (IMAGE() ready); when the
+  URL is left blank the share package only exists on the Drive mount.
+- **Out of scope for this notebook:** video frame extraction, identity
+  review / labeling, Drive metadata write-back to source files. Frame
+  extraction stays in the local pipeline; the other two are future work."""
 
 
 # ---------------------------------------------------------------------------
@@ -848,6 +1463,12 @@ def build() -> nbf.NotebookNode:
         code(CELL_09_DISCOVER),
         md(CELL_10_HEADER_DETECT),
         code(CELL_11_DETECT),
+        md(CELL_CLUSTER_HEADER),
+        code(CELL_CLUSTER),
+        md(CELL_SHARE_HEADER),
+        code(CELL_SHARE),
+        md(CELL_UPLOAD_HEADER),
+        code(CELL_UPLOAD),
         md(CELL_12_HEADER_COMPOSE),
         code(CELL_13_COMPOSE),
         md(CELL_14_HEADER_SUMMARY),
