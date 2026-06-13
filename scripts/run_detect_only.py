@@ -49,7 +49,7 @@ from unlabeled_media_tagger.drive.auth import get_drive_service
 from unlabeled_media_tagger.drive.files import download_file
 from unlabeled_media_tagger.pipeline.detect_faces import detect_faces_in_image
 from unlabeled_media_tagger.pipeline.download_pool import ByteBudget, DownloadPool
-from unlabeled_media_tagger.pipeline.extract import ExtractStage
+from unlabeled_media_tagger.pipeline.extract import ExtractStage, UnreadableMediaError
 from unlabeled_media_tagger.preprocessing.blur import (
     classify_quality,
     laplacian_variance,
@@ -70,9 +70,11 @@ MANIFEST_COLUMNS = [
     "error",
 ]
 
-# Per-file statuses that count as "successfully processed" — re-runs skip these.
-# download_error / detect_error are excluded so transient failures get retried.
-TERMINAL_STATUSES = {"ok", "no_faces"}
+# Per-file statuses a re-run should NOT reprocess. ok/no_faces = success;
+# unreadable = a permanent decode failure (corrupt/unsupported file) that a
+# re-download can't fix, so skip it too. download_error / detect_error are
+# excluded so genuinely transient failures still get retried.
+TERMINAL_STATUSES = {"ok", "no_faces", "unreadable"}
 
 MIN_FACE_SIDE = 10  # bbox shorter side below this -> skipped_small (pre-crop)
 
@@ -257,6 +259,10 @@ def detect_from_result(result, extract_stage, crops_root, detector_backend,
             extract_stage, crops_root, detector_backend, max_crops_per_file, mrow,
         )
         mrow["status"] = "ok" if face_rows else "no_faces"
+    except UnreadableMediaError as exc:
+        # Permanent: corrupt/undecodable file. Terminal so resume skips it.
+        mrow["status"] = "unreadable"
+        mrow["error"] = f"{type(exc).__name__}: {exc}"
     except Exception as exc:  # noqa: BLE001 - record + continue, don't abort run
         mrow["status"] = "detect_error"
         mrow["error"] = f"{type(exc).__name__}: {exc}"
@@ -283,6 +289,12 @@ def process_item(item, service, extract_stage, crops_root, scratch_root,
             extract_stage, crops_root, detector_backend, max_crops_per_file, mrow,
         )
         mrow["status"] = "ok" if face_rows else "no_faces"
+    except UnreadableMediaError as exc:
+        # Permanent: corrupt/undecodable file. Terminal so resume skips it.
+        mrow["status"] = "unreadable"
+        mrow["error"] = f"{type(exc).__name__}: {exc}"
+        if verbose:
+            print(f"  ! {item['file_id']}: {mrow['error']}", flush=True)
     except Exception as exc:  # noqa: BLE001 - record + continue, don't abort run
         stage = "detect_error" if mrow["download_sec"] != "" else "download_error"
         mrow["status"] = stage
@@ -312,7 +324,8 @@ class ResultSink:
         self.total = total
         self.verbose = verbose
         self.n = 0
-        self.totals = {"faces": 0, "crops": 0, "ok": 0, "no_faces": 0, "error": 0}
+        self.totals = {"faces": 0, "crops": 0, "ok": 0, "no_faces": 0,
+                       "unreadable": 0, "error": 0}
 
     def record(self, mrow, face_rows):
         self.n += 1
@@ -327,7 +340,7 @@ class ResultSink:
         })
         self.totals["faces"] += mrow["faces_detected"]
         self.totals["crops"] += mrow["crops_written"]
-        if mrow["status"] in ("ok", "no_faces"):
+        if mrow["status"] in ("ok", "no_faces", "unreadable"):
             self.totals[mrow["status"]] += 1
         else:
             self.totals["error"] += 1
@@ -421,8 +434,8 @@ def main(argv=None):
 
     t = sink.totals
     print(f"\n=== done === processed={len(todo)} ok={t['ok']} "
-          f"no_faces={t['no_faces']} errors={t['error']} "
-          f"faces={t['faces']} crops={t['crops']}", flush=True)
+          f"no_faces={t['no_faces']} unreadable={t['unreadable']} "
+          f"errors={t['error']} faces={t['faces']} crops={t['crops']}", flush=True)
     print(f"crops dir: {crops_root}")
     print(f"asset_faces.csv: {out / 'asset_faces.csv'}")
     print(f"preprocessing_manifest.csv: {out / 'preprocessing_manifest.csv'}")

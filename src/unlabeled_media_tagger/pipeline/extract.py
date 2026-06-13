@@ -5,6 +5,15 @@ from pathlib import Path
 from unlabeled_media_tagger.utils.file_utils import is_image_file, is_video_file
 
 
+class UnreadableMediaError(ValueError):
+    """A media file cannot be decoded — unsupported type, or a corrupt/
+    unopenable video. This is a *permanent* property of the file (a successful
+    re-download won't fix it), so callers can treat it as terminal rather than
+    retrying. Subclasses ValueError for backward compatibility with callers
+    that catch the broader type.
+    """
+
+
 class ExtractStage:
     """
     Extract stage for processing media files and extracting relevant data.
@@ -60,7 +69,7 @@ class ExtractStage:
         if is_video_file(str(media_path)):
             return self._extract_video_frames(media_path)
 
-        raise ValueError(f"Unsupported media file type: {media_file}")
+        raise UnreadableMediaError(f"Unsupported media file type: {media_file}")
 
     def _extract_video_frames(self, media_path: Path) -> dict:
         import cv2
@@ -72,7 +81,7 @@ class ExtractStage:
 
         cap = cv2.VideoCapture(str(media_path))
         if not cap.isOpened():
-            raise ValueError(f"Failed to open video: {media_path}")
+            raise UnreadableMediaError(f"Failed to open video: {media_path}")
 
         frames = []
         try:
