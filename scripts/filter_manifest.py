@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import os
 import sys
 
 DEFAULT_EXCLUDES = ["/face_preprocessing/", "/crops/"]
@@ -33,9 +34,18 @@ def main(argv=None):
     ap.add_argument("--exclude", action="append", default=None,
                     help="Path substring to drop (case-insensitive). Repeatable. "
                          f"Defaults to: {' '.join(DEFAULT_EXCLUDES)}")
+    ap.add_argument("--include-ext", default=None,
+                    help="Comma-separated extensions to KEEP (e.g. "
+                         "'.mp4,.mov,.jpg'). Rows whose path extension isn't "
+                         "listed are dropped. Use to keep only decodable media "
+                         "and avoid downloading files cv2 can't read.")
     ap.add_argument("--path-column", default="path")
     args = ap.parse_args(argv)
     excludes = [e.lower() for e in (args.exclude or DEFAULT_EXCLUDES)]
+    include_ext = None
+    if args.include_ext:
+        include_ext = {("." + e.lstrip(".")).lower()
+                       for e in args.include_ext.split(",") if e.strip()}
 
     with open(args.infile, newline="") as fh:
         reader = csv.DictReader(fh)
@@ -47,8 +57,11 @@ def main(argv=None):
 
     kept, dropped = [], 0
     for r in rows:
-        p = (r.get(args.path_column) or "").lower()
-        if any(sub in p for sub in excludes):
+        p = (r.get(args.path_column) or "")
+        pl = p.lower()
+        if any(sub in pl for sub in excludes):
+            dropped += 1
+        elif include_ext is not None and os.path.splitext(pl)[1] not in include_ext:
             dropped += 1
         else:
             kept.append(r)
@@ -60,6 +73,8 @@ def main(argv=None):
 
     print(f"in: {len(rows)} rows  dropped: {dropped}  kept: {len(kept)}")
     print(f"excludes: {excludes}")
+    if include_ext is not None:
+        print(f"include-ext: {sorted(include_ext)}")
     print(f"wrote: {args.outfile}")
     return 0
 
