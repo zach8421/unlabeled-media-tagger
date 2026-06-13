@@ -1,5 +1,12 @@
 # Project status — slice 5 complete
 
+> **ACTIVE WORK-STREAM (2026-06-13): FOLDER 2 detect-only bulk run.**
+> A separate, long-running job (auto-advancing 33 × 3 TB chunks, ~18 days) is
+> in progress — independent of the slice 1–5 share pipeline documented below.
+> For its current state and the stop/resume/monitor runbook, see the
+> "⮕ RESUME HERE" block at the top of
+> `dev-log/2026-06-11-detect-only-drive-run.md` (dev-log is gitignored / local).
+
 ## Current state
 
 - Slices 1-4 shipped to main. Pipeline auto-generates share package,
