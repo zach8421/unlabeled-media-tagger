@@ -79,6 +79,8 @@ def download_file(
     file_id: str,
     destination_path: str,
     supports_all_drives: bool = True,
+    rate_limiter=None,
+    chunksize: Optional[int] = None,
 ) -> str:
     """
     Download a Google Drive file to a local path.
@@ -91,12 +93,23 @@ def download_file(
             files that live on a Shared Drive resolve (without it the API
             returns 404 for Shared-Drive items). Safe for My-Drive files too,
             so it defaults on.
+        rate_limiter: Optional object with ``acquire(nbytes)`` (e.g.
+            ``pipeline.rate_limit.BandwidthLimiter``). When given, ``acquire``
+            is called for one chunk's worth of bytes before each chunk is
+            fetched, so a limiter shared across workers caps aggregate download
+            bandwidth. ``None`` = no throttling (default).
+        chunksize: Bytes per ``next_chunk`` HTTP range request. ``None`` uses
+            googleapiclient's default (100 MiB). Smaller chunks give smoother
+            throttling when ``rate_limiter`` is set.
 
     Returns:
         Local destination path.
     """
     try:
-        from googleapiclient.http import MediaIoBaseDownload
+        from googleapiclient.http import (
+            DEFAULT_CHUNK_SIZE,
+            MediaIoBaseDownload,
+        )
     except ImportError as exc:
         raise ImportError(
             "Google Drive dependencies are not installed. Install the package "
@@ -109,10 +122,18 @@ def download_file(
     request = service.files().get_media(
         fileId=file_id, supportsAllDrives=supports_all_drives
     )
+    chunk_bytes = int(chunksize) if chunksize else DEFAULT_CHUNK_SIZE
     with destination.open("wb") as file_handle:
-        downloader = MediaIoBaseDownload(file_handle, request)
+        downloader = MediaIoBaseDownload(
+            file_handle, request, chunksize=chunk_bytes
+        )
         done = False
         while not done:
+            if rate_limiter is not None:
+                # Spend one chunk of budget before fetching it. The final chunk
+                # may be smaller, so this slightly over-throttles the tail —
+                # negligible, and keeps the long-run rate at/under the cap.
+                rate_limiter.acquire(chunk_bytes)
             _, done = downloader.next_chunk()
 
     return str(destination)

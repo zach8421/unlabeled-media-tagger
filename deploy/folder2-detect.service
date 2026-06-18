@@ -1,0 +1,43 @@
+# systemd USER service for the FOLDER 2 detect-only run.
+#
+# Runs the auto-advance driver unattended: starts on (user) login/boot, restarts
+# on crash, and goes inactive when all chunks finish. Resume is per-file via
+# progress.jsonl, so a restart just continues. The bandwidth schedule lives in
+# the driver (full speed 02:00–08:00, else 60 MB/s); see run_folder2_chunks.sh.
+#
+# Install (no root needed for the unit itself):
+#   mkdir -p ~/.config/systemd/user
+#   cp deploy/folder2-detect.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now folder2-detect.service
+# To survive reboot WITHOUT an active login (one-time, needs root):
+#   sudo loginctl enable-linger $USER
+#
+# Control:
+#   systemctl --user status folder2-detect          # state
+#   journalctl --user -u folder2-detect -f           # live driver log
+#   systemctl --user stop folder2-detect             # clean stop (whole cgroup)
+#   systemctl --user start folder2-detect            # resume
+#
+# NOTE: under systemd, do NOT stop with `pkill` — Restart=on-failure would just
+# relaunch it. Use `systemctl --user stop`.
+
+[Unit]
+Description=FOLDER 2 detect-only chunked run (auto-advance driver)
+After=network-online.target
+Wants=network-online.target
+# Don't restart-storm on a persistent failure (e.g. disk full, dead auth).
+StartLimitIntervalSec=3600
+StartLimitBurst=8
+
+[Service]
+Type=simple
+WorkingDirectory=/home/ml/projects/unlabeled-media-tagger
+ExecStart=/bin/bash /home/ml/projects/unlabeled-media-tagger/scripts/run_folder2_chunks.sh 1 32
+# Resume after a crash/OOM/transient failure; success (all chunks done) exits 0
+# and stays stopped.
+Restart=on-failure
+RestartSec=60
+
+[Install]
+WantedBy=default.target

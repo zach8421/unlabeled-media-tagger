@@ -27,12 +27,16 @@ OUT=/mnt/media1/folder2_detect
 SCRATCH=/mnt/ssd-scratch/detect-scratch/folder2
 START=${1:-1}
 END=${2:-32}
+# Bandwidth schedule: full speed inside BW_WINDOW (local hours), else cap to
+# BW_CAP MB/s (decimal; 60 MB/s = 480 Mbps). Override via env if needed.
+BW_CAP=${BW_CAP:-60}
+BW_WINDOW=${BW_WINDOW:-2-8}
 
 mkdir -p "$OUT" "$SCRATCH"
 DRIVER_LOG="$OUT/driver.log"
 log(){ echo "$(date -Is) | $*" | tee -a "$DRIVER_LOG"; }
 
-log "driver start: chunks $START..$END  out=$OUT  scratch=$SCRATCH"
+log "driver start: chunks $START..$END  out=$OUT  scratch=$SCRATCH  bw_cap=${BW_CAP}MB/s full_window=${BW_WINDOW}"
 for i in $(seq "$START" "$END"); do
   n=$(printf "%03d" "$i")
   chunk="$MANIFEST_DIR/chunk_$n.csv"
@@ -49,6 +53,7 @@ for i in $(seq "$START" "$END"); do
   CUDA_VISIBLE_DEVICES=0 "$PY" scripts/run_detect_only.py "$chunk" \
       --output-dir "$OUT" --scratch-dir "$SCRATCH" \
       --frame-interval 5.0 --max-frames 60 --workers 8 --max-inflight-gb 200 \
+      --bw-cap "$BW_CAP" --bw-full-window "$BW_WINDOW" \
       >> "$OUT/chunk_$n.log" 2>&1
   rc=$?
   if [ "$rc" -ne 0 ]; then

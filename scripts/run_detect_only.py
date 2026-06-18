@@ -50,6 +50,10 @@ from unlabeled_media_tagger.drive.files import download_file
 from unlabeled_media_tagger.pipeline.detect_faces import detect_faces_in_image
 from unlabeled_media_tagger.pipeline.download_pool import ByteBudget, DownloadPool
 from unlabeled_media_tagger.pipeline.extract import ExtractStage, UnreadableMediaError
+from unlabeled_media_tagger.pipeline.rate_limit import (
+    BandwidthLimiter,
+    tod_rate_provider,
+)
 from unlabeled_media_tagger.preprocessing.blur import (
     classify_quality,
     laplacian_variance,
@@ -132,18 +136,30 @@ def new_mrow(item) -> dict:
     }
 
 
-def download_item(service, item, scratch_root) -> dict:
+# Chunk size used only while a bandwidth cap is active — small chunks let the
+# shared token bucket pace smoothly. When uncapped (full-speed window) we leave
+# chunksize at the library default (100 MiB) for max throughput.
+CAPPED_CHUNK_BYTES = 16 * 1024 * 1024
+
+
+def download_item(service, item, scratch_root, rate_limiter=None) -> dict:
     """Download one manifest item to its scratch dir (DownloadPool download_fn).
 
     Returns the keys DownloadPool merges into the result dict. Raises on
-    failure (the pool records it as download_error).
+    failure (the pool records it as download_error). When ``rate_limiter`` is
+    given, aggregate bandwidth is throttled per the limiter's current schedule.
     """
     file_id = item["file_id"]
     name = Path(item["path"]).name or file_id
     item_scratch = Path(scratch_root) / file_id
     local_path = item_scratch / name
+    # Small chunks only while a cap is active (limiter.current_rate() not None).
+    chunksize = (CAPPED_CHUNK_BYTES
+                 if rate_limiter is not None and rate_limiter.current_rate()
+                 else None)
     t0 = time.time()
-    download_file(service, file_id, str(local_path), supports_all_drives=True)
+    download_file(service, file_id, str(local_path), supports_all_drives=True,
+                  rate_limiter=rate_limiter, chunksize=chunksize)
     return {
         "local_path": str(local_path), "name": name,
         "item_scratch": item_scratch, "download_sec": round(time.time() - t0, 2),
@@ -272,7 +288,7 @@ def detect_from_result(result, extract_stage, crops_root, detector_backend,
 
 
 def process_item(item, service, extract_stage, crops_root, scratch_root,
-                 detector_backend, max_crops_per_file, verbose):
+                 detector_backend, max_crops_per_file, verbose, rate_limiter=None):
     """Sequential (--workers 1) path: download -> detect one item inline.
 
     Always cleans up scratch in finally. Mirrors detect_from_result's status
@@ -282,7 +298,7 @@ def process_item(item, service, extract_stage, crops_root, scratch_root,
     mrow = new_mrow(item)
     face_rows = []
     try:
-        dl = download_item(service, item, scratch_root)
+        dl = download_item(service, item, scratch_root, rate_limiter=rate_limiter)
         mrow["download_sec"] = dl["download_sec"]
         face_rows = detect_and_crop(
             item, dl["local_path"], dl["name"], item_scratch,
@@ -371,10 +387,29 @@ def main(argv=None):
                     help="Cap on concurrently-downloaded bytes (peak scratch "
                          "ceiling). Only used when --workers > 1.")
     ap.add_argument("--detector-backend", default="retinaface")
+    ap.add_argument("--bw-cap", type=float, default=0.0,
+                    help="Aggregate download cap in MB/s (decimal) during the "
+                         "throttle window, shared across all workers. 0 = no "
+                         "limit. e.g. 60 = 60 MB/s = 480 Mbps.")
+    ap.add_argument("--bw-full-window", default="2-8",
+                    help="Local-clock hour window START-END with NO cap (full "
+                         "speed); capped outside it. e.g. '2-8' = 02:00–08:00 "
+                         "uncapped. START>END wraps midnight.")
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args(argv)
     verbose = not args.quiet
+
+    rate_limiter = None
+    if args.bw_cap and args.bw_cap > 0:
+        start_s, _, end_s = args.bw_full_window.partition("-")
+        full_window = (int(start_s), int(end_s))
+        capped_bps = int(args.bw_cap * 1_000_000)  # decimal MB/s -> bytes/sec
+        rate_limiter = BandwidthLimiter(
+            tod_rate_provider(capped_bps, full_window=full_window))
+        print(f"bandwidth: cap {args.bw_cap:g} MB/s ({args.bw_cap * 8:g} Mbps) "
+              f"outside {full_window[0]:02d}:00–{full_window[1]:02d}:00 "
+              f"(full speed inside)", flush=True)
 
     out = Path(args.output_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -408,6 +443,7 @@ def main(argv=None):
             mrow, face_rows = process_item(
                 item, service, extract_stage, crops_root, scratch_root,
                 args.detector_backend, args.max_crops_per_file, verbose,
+                rate_limiter=rate_limiter,
             )
             sink.record(mrow, face_rows)
     else:
@@ -418,8 +454,13 @@ def main(argv=None):
         get_drive_service(verbose=verbose)  # ensure token is fresh up front
         services = [get_drive_service(verbose=False) for _ in range(workers)]
         budget = ByteBudget(int(args.max_inflight_gb * GB))
+
+        def download_fn(service, item, scratch_root):
+            return download_item(service, item, scratch_root,
+                                 rate_limiter=rate_limiter)
+
         pool = DownloadPool(
-            download_fn=download_item, services=services,
+            download_fn=download_fn, services=services,
             scratch_root=scratch_root, budget=budget,
         )
 
