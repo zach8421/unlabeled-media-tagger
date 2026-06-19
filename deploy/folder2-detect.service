@@ -33,6 +33,10 @@ StartLimitBurst=8
 [Service]
 Type=simple
 WorkingDirectory=/home/ml/projects/unlabeled-media-tagger
+# Optional speed override, written by scripts/folder2_speed.sh (full|scheduled).
+# Leading '-' = ignore if the file is absent (driver falls back to its defaults:
+# BW_CAP=60, BW_WINDOW=2-8).
+EnvironmentFile=-%h/.config/folder2-detect.env
 ExecStart=/bin/bash /home/ml/projects/unlabeled-media-tagger/scripts/run_folder2_chunks.sh 1 32
 # Resume after a crash/OOM/transient failure; success (all chunks done) exits 0
 # and stays stopped.
