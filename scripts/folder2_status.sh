@@ -22,8 +22,17 @@ echo "service : $(systemctl --user is-active folder2-detect 2>/dev/null) ($(syst
 echo "progress: $recorded / $total files (${pct}%)"
 echo "  ok=$ok  no_faces=$nofaces  unreadable=$unread  detect_err=$derr  download_err=$dlerr"
 echo "chunk   : $(grep -E 'chunk .* (START|DONE)' "$OUT/driver.log" 2>/dev/null | tail -1 | sed 's/.*| //')"
-echo "crops   : $(find "$OUT/crops" -type f 2>/dev/null | wc -l) face crops on disk"
+# Fast crop accounting: count per-asset crop subdirs via the parent dir's
+# hardlink count (links = subdirs + 2), which is O(1). The old recursive
+# `find -type f` walked ~1.6M files / 57k dirs and took ~35s, which made this
+# read-only status check look hung. Use --crops for the exact per-file count.
+crop_links=$(stat -c '%h' "$OUT/crops" 2>/dev/null || echo 2)
+echo "crops   : $((crop_links - 2)) asset crop-dirs on disk (use --crops for exact file count)"
 echo "media1  : $(df -h /mnt/media1 2>/dev/null | awk '/mnt/{print $4" free"}')"
+
+if [ "${1:-}" = "--crops" ]; then
+  echo "crops(f): $(find "$OUT/crops" -type f 2>/dev/null | wc -l) face crops on disk (slow scan)"
+fi
 
 if [ "${1:-}" = "--rate" ]; then
   iface=$(ip route show default | awk '{print $5; exit}')
