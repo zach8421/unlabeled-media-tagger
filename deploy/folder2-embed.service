@@ -1,0 +1,47 @@
+# systemd USER service for the FOLDER 2 batched ArcFace embedding run.
+#
+# Embeds every status=ok face crop listed in embed_manifest.csv (built by
+# scripts/build_embed_manifest.py) into L2-normalized 512-d shards under
+# /mnt/media1/folder2_embed/. Resume is per-shard via progress.jsonl, so a
+# restart just continues; success (all shards + finalize) exits 0 and stays
+# stopped. Expected wall clock is ~15-30 min at ~1,200 faces/s on one TITAN Xp.
+#
+# BEFORE the first full run, the parity self-check must pass:
+#   CUDA_VISIBLE_DEVICES=0 PYTHONPATH=src ./.venv/bin/python \
+#       scripts/run_embed_batch.py --self-check 1000
+#
+# Install:
+#   cp deploy/folder2-embed.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user start folder2-embed.service      # one-shot style run
+#
+# Control:
+#   scripts/folder2_embed_status.sh                    # progress summary
+#   journalctl --user -u folder2-embed -f              # live log
+#   systemctl --user stop folder2-embed                # clean stop (resumable)
+
+[Unit]
+Description=FOLDER 2 batched ArcFace embedding run
+# Don't restart-storm on a persistent failure (disk full, bad manifest).
+StartLimitIntervalSec=3600
+StartLimitBurst=8
+
+[Service]
+Type=simple
+WorkingDirectory=/home/ml/projects/unlabeled-media-tagger
+Environment=CUDA_VISIBLE_DEVICES=0
+Environment=PYTHONPATH=src
+ExecStart=/home/ml/projects/unlabeled-media-tagger/.venv/bin/python \
+    /home/ml/projects/unlabeled-media-tagger/scripts/run_embed_batch.py \
+    --manifest /mnt/media1/folder2_embed/embed_manifest.csv \
+    --output-dir /mnt/media1/folder2_embed
+# Resume after crash/OOM/transient failure; success exits 0 and stays stopped.
+# Exit 1 (finalize reconciliation MISMATCH) and 2 (refuse-resume: manifest or
+# shard params changed) are deterministic — restarting would just burn a full
+# model init per retry until StartLimitBurst fails the unit.
+Restart=on-failure
+RestartPreventExitStatus=1 2
+RestartSec=30
+
+[Install]
+WantedBy=default.target
