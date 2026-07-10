@@ -41,6 +41,24 @@ class RunData:
 
         with (self.run_dir / "cluster_summary.csv").open(newline="") as fh:
             self.summary = list(csv.DictReader(fh))
+        self.summary_of = {row["cluster_id"]: row for row in self.summary}
+
+        # Merge-discovery suggestions (scripts/build_cluster_neighbors.py):
+        # cluster_id -> ranked neighbor rows, rendered as the "similar
+        # clusters" strip on group pages and the /merges candidate list.
+        self.neighbors_of = defaultdict(list)
+        neighbors_path = self.run_dir / "cluster_neighbors.csv"
+        if neighbors_path.exists():
+            with neighbors_path.open(newline="") as fh:
+                for row in csv.DictReader(fh):
+                    try:
+                        float(row["cosine"])
+                    except (KeyError, TypeError, ValueError):
+                        continue  # truncated/corrupt row: skip, don't
+                        # brick every page that renders neighbors
+                    if not row.get("neighbor_cluster_id"):
+                        continue
+                    self.neighbors_of[row["cluster_id"]].append(row)
 
         # cluster_id -> its node rows.
         self.nodes_of_cluster = defaultdict(list)
@@ -153,6 +171,57 @@ class ReviewHandler(BaseHTTPRequestHandler):
                             "name": identity["name"]}
         return None
 
+    def _removed_of(self, state, cluster_id: str) -> set:
+        return {face_key for run, cid, face_key in state.removed_from_cluster
+                if run == self.data.run_id and cid == cluster_id}
+
+    def _medoid_of(self, cluster_id: str, removed: set = frozenset()):
+        """Representative face_key — never one the reviewer removed (it is
+        the visual evidence merge decisions rest on)."""
+        rows = self.data.nodes_of_cluster.get(cluster_id, [])
+        candidates = [r for r in rows if r["face_key"] not in removed] or rows
+        if not candidates:
+            return None
+        return max(candidates, key=lambda r:
+                   float(r["similarity_to_cluster"] or 0))["face_key"]
+
+    def _similar_clusters(self, cluster_id: str, status_of: dict,
+                          state=None, identity=None) -> list:
+        """Neighbor rows dressed for rendering: label, size, status, thumb.
+
+        identity (the current cluster's confirmed identity, if any) marks
+        neighbors that already resolve to the same canonical identity as
+        'merged' so the strip doesn't offer a self-merge."""
+        similar = []
+        for neighbor in self.data.neighbors_of.get(cluster_id, []):
+            neighbor_id = neighbor["neighbor_cluster_id"]
+            summary = self.data.summary_of.get(neighbor_id)
+            if summary is None:
+                continue  # stale neighbors file from an earlier run layout
+            status = status_of.get(neighbor_id)
+            merged = False
+            if identity is not None and state is not None \
+                    and status and status[0] == "confirmed":
+                other = self._cluster_identity(state, neighbor_id)
+                merged = (other is not None and
+                          other["identity_id"] == identity["identity_id"])
+            similar.append({
+                "merged": merged,
+                "cluster_id": neighbor_id,
+                "label": self.data.label_of_cluster.get(
+                    neighbor_id, f"cluster {neighbor_id}"),
+                "n_faces": summary["n_faces"],
+                "cosine": neighbor["cosine"],
+                "shared_events": neighbor["shared_events"],
+                "status": status[0] if status else None,
+                "name": status[1] if status else "",
+                "medoid": self._medoid_of(
+                    neighbor_id,
+                    self._removed_of(state, neighbor_id)
+                    if state is not None else frozenset()),
+            })
+        return similar
+
     def _recent_events(self, limit: int = 15):
         summaries = []
         for event in reversed(self.store.events()[-200:]):
@@ -197,18 +266,61 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 return self._html("<h1>404 no such cluster</h1>", 404)
             state = self.store.replay()
             faces = self.data.faces_of_cluster(cluster_id)
-            removed = {face_key for run, cid, face_key
-                       in state.removed_from_cluster
-                       if run == self.data.run_id and cid == cluster_id}
+            removed = self._removed_of(state, cluster_id)
+            identity = self._cluster_identity(state, cluster_id)
             return self._html(pages.render_group(
                 self.data.run_id, cluster_id,
                 self.data.label_of_cluster[cluster_id], faces,
-                identity=self._cluster_identity(state, cluster_id),
+                identity=identity,
                 rejected=state.cluster_review.get(
                     (self.data.run_id, cluster_id)) == "rejected",
                 removed_keys=removed,
                 recent_events=self._recent_events(),
-                page=page, sort=query.get("sort", ["central"])[0]))
+                page=page, sort=query.get("sort", ["central"])[0],
+                similar=self._similar_clusters(
+                    cluster_id, self._review_status(state),
+                    state=state, identity=identity)))
+
+        if parsed.path == "/merges":
+            state = self.store.replay()
+            status_of = self._review_status(state)
+            seen = set()
+            pairs = []
+            for cluster_id, neighbors in self.data.neighbors_of.items():
+                for neighbor in neighbors:
+                    key = tuple(sorted((cluster_id,
+                                        neighbor["neighbor_cluster_id"])))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    if any(c not in self.data.summary_of for c in key):
+                        continue  # stale neighbors file: cluster ids that
+                        # no longer exist must not offer a live merge
+                    if any(status_of.get(c, ("",))[0] != "confirmed"
+                           for c in key):
+                        continue
+                    identities = [self._cluster_identity(state, c)
+                                  for c in key]
+                    if any(i is None for i in identities):
+                        continue
+                    pairs.append({
+                        "cosine": neighbor["cosine"],
+                        "shared_events": neighbor["shared_events"],
+                        "merged": (identities[0]["identity_id"]
+                                   == identities[1]["identity_id"]),
+                        "clusters": [
+                            {"cluster_id": c,
+                             "label": self.data.label_of_cluster.get(c, c),
+                             "n_faces": self.data.summary_of.get(
+                                 c, {}).get("n_faces", "?"),
+                             "name": ident["name"],
+                             "medoid": self._medoid_of(
+                                 c, self._removed_of(state, c))}
+                            for c, ident in zip(key, identities)],
+                    })
+            pairs.sort(key=lambda p: -float(p["cosine"]))
+            return self._html(pages.render_merges(
+                self.data.run_id, pairs, page=page))
 
         if parsed.path == "/queue":
             state = self.store.replay()
@@ -431,6 +543,15 @@ class ReviewHandler(BaseHTTPRequestHandler):
             cluster_ids = [str(c) for c in payload.get("cluster_ids", [])]
             identities = []
             for cluster_id in cluster_ids:
+                # cluster_review is last-decision-wins: a confirm followed by
+                # a reject leaves the confirm event (and its identity) in the
+                # log, so gate here or a rejected cluster's withdrawn
+                # identity could become a merge target via direct POST.
+                if state.cluster_review.get(
+                        (run_id, cluster_id)) != "confirmed":
+                    raise ValueError(
+                        f"cluster {cluster_id} is not currently confirmed "
+                        f"(last decision wins) — re-confirm before merging")
                 identity = self._cluster_identity(state, cluster_id)
                 if identity is None:
                     raise ValueError(

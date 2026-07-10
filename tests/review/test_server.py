@@ -104,6 +104,100 @@ def test_index_and_group_render(client):
     assert b"fileA/a1.jpg" in body
 
 
+def test_similar_strip_and_merges_page(run_fixture):
+    (run_fixture["run_dir"] / "cluster_neighbors.csv").write_text(
+        "cluster_id,rank,neighbor_cluster_id,cosine,shared_events\n"
+        "0,1,1,0.912,1\n"
+        "1,1,0,0.912,1\n"
+        "0,2,99,0.88,0\n"    # stale: cluster 99 no longer exists
+        "1,2,0,\n"           # truncated row (builder killed mid-write)
+        "1,3\n")             # short row
+    server = serve(run_fixture["labels"], run_fixture["run_dir"],
+                   crops_root=run_fixture["crops"], port=0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+
+    def request(path, payload=None):
+        if payload is None:
+            req = urllib.request.Request(base + path)
+        else:
+            req = urllib.request.Request(
+                base + path, data=json.dumps(payload).encode(),
+                headers={"Content-Type": "application/json"}, method="POST")
+        try:
+            with urllib.request.urlopen(req) as resp:
+                return resp.status, resp.read()
+        except urllib.error.HTTPError as err:
+            return err.code, err.read()
+
+    try:
+        # Unconfirmed cluster: strip renders, but merging is gated.
+        _, body = request("/group/0")
+        assert b"Similar clusters" in body and b"person_00001" in body
+        assert b"0.912" in body and b"1 shared event" in body
+        assert b"confirm this cluster to enable merging" in body
+        assert b"class='simsel'" not in body  # no checkbox until confirmed
+        assert b"/group/99" not in body  # stale neighbor id skipped
+        # ...and corrupt rows didn't brick the other cluster's page either
+        status, body = request("/group/1")
+        assert status == 200
+        # Strip thumbnails must never showcase a reviewer-removed face.
+        # (assert on /crop/ src URLs: the raw face_key also appears in the
+        # recent-events sidebar text after the removal)
+        assert b"/crop/fileA/a1.jpg" in body  # cluster 0's medoid thumb
+        request("/api/mark", {"action": "remove_face", "cluster_id": 0,
+                              "face_key": "fileA/a1.jpg"})
+        _, body = request("/group/1")
+        assert b"/crop/fileA/a1.jpg" not in body
+        assert b"/crop/fileB/b1.jpg" in body  # next-best face steps in
+        # No both-confirmed pairs yet.
+        _, body = request("/merges")
+        assert b"No both-confirmed similar pairs yet" in body
+
+        request("/api/mark", {"action": "confirm_cluster", "cluster_id": 0,
+                              "identity_name": "Ana"})
+        request("/api/mark", {"action": "confirm_cluster", "cluster_id": 1,
+                              "identity_name": "Ana B"})
+
+        # Both confirmed: checkbox on the strip, pair listed on /merges.
+        _, body = request("/group/0")
+        assert b"class='simsel'" in body
+        assert b"merge selected into this" in body
+        _, body = request("/merges")
+        assert b"person_00000" in body and b"person_00001" in body
+        assert b"same person</button>" in body and b"1 still separate" in body
+        # onclick must survive HTML attribute quoting (single-quoted args)
+        assert b"mergePair(this, '0', '1')" in body
+
+        # Merge via the API the page button uses; pair should dim as merged.
+        status, _ = request("/api/mark", {
+            "action": "merge_cluster_identities", "cluster_ids": ["0", "1"]})
+        assert status == 200
+        _, body = request("/merges")
+        assert b"0 still separate" in body and b"merged</span>" in body
+        assert b"same person</button>" not in body
+        # Strip mirrors the merged state: no self-merge checkbox offered.
+        _, body = request("/group/0")
+        assert b"merged</span>" in body
+        assert b"class='simsel'" not in body
+
+        # Rejected-after-confirm must lose the merge UI: a withdrawn
+        # identity can never be a merge target.
+        request("/api/mark", {"action": "reject_cluster", "cluster_id": 0})
+        _, body = request("/group/0")
+        assert b"confirm this cluster to enable merging" in body
+        assert b"class='simsel'" not in body
+        _, body = request("/merges")
+        assert b"same person</button>" not in body
+        # ...and the API refuses too — the UI gate alone is not the defense.
+        status, body = request("/api/mark", {
+            "action": "merge_cluster_identities", "cluster_ids": ["0", "1"]})
+        assert status == 400 and b"not currently confirmed" in body
+    finally:
+        server.shutdown()
+
+
 def test_triage_view(run_fixture):
     (run_fixture["run_dir"] / "triage.csv").write_text(
         "rank,section,reason,cluster_id\n"

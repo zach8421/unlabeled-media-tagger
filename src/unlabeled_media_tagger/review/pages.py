@@ -181,7 +181,8 @@ def render_index(run_id: str, clusters: list, review_status: dict,
         triage_link = (f" · <a href='/?view=triage'>triage queue "
                        f"({n_triage})</a>" if n_triage else "")
         crumbs = (f"{len(clusters)} clusters, {n_reviewed} reviewed"
-                  f"{triage_link} · <a href='/queue'>growth review queue</a>")
+                  f"{triage_link} · <a href='/queue'>growth review queue</a>"
+                  f" · <a href='/merges'>merge candidates</a>")
         reason_th = ""
     body = (
         f"<h1>{heading}</h1>"
@@ -272,16 +273,71 @@ document.addEventListener('keydown', e => {
   else if (e.key === 'n') { document.getElementById('name').focus(); e.preventDefault(); }
   else if (e.key === 'u') { const b = document.querySelector('.events button'); if (b) b.click(); }
 });
+async function mergeSimilar() {
+  const cids = Array.from(document.querySelectorAll('.simsel:checked'))
+                    .map(el => el.dataset.cid);
+  if (!cids.length) { alert('tick at least one confirmed similar cluster'); return; }
+  if (!confirm(`Merge ${cids.length} cluster(s) into this one as the same person?`))
+    return;
+  if (await api({action: 'merge_cluster_identities',
+                 cluster_ids: [CLUSTER_ID, ...cids]})) location.reload();
+}
 """
+
+
+def _status_badge(status: str | None, name: str = "") -> str:
+    if status == "confirmed":
+        return (f"<span class='badge confirmed'>"
+                f"{html.escape(name or '(unnamed)')}</span>")
+    if status == "rejected":
+        return "<span class='badge rejected'>rejected</span>"
+    return "<span class='badge new'>unreviewed</span>"
+
+
+def _similar_strip(similar: list, confirmed: bool) -> str:
+    """The merge-discovery strip: nearest clusters by centroid cosine.
+
+    Checkboxes appear only for confirmed neighbors of a confirmed cluster —
+    identity.merge is defined on confirmed identities, so anything else gets
+    a link to go confirm first."""
+    rows = []
+    for s in similar:
+        if s.get("merged"):  # already the same canonical identity
+            checkbox = "<span class='badge confirmed'>merged</span>"
+        else:
+            checkbox = (f"<input type='checkbox' class='simsel' "
+                        f"data-cid='{html.escape(str(s['cluster_id']), quote=True)}'>"
+                        if confirmed and s["status"] == "confirmed" else "")
+        thumb = (f"<img src='{html.escape(crop_src(s['medoid']), quote=True)}' "
+                 f"loading='lazy'>" if s["medoid"] else "")
+        try:
+            shared = int(s["shared_events"] or 0)
+        except ValueError:
+            shared = 0
+        shared_note = (f" · <b>{shared} shared event(s)</b>" if shared else "")
+        rows.append(
+            f"<div class='pair-row'>{checkbox}{thumb}"
+            f"<div><a href='/group/{s['cluster_id']}'>"
+            f"{html.escape(s['label'])}</a> "
+            f"{_status_badge(s['status'], s['name'])}<br>"
+            f"cos {float(s['cosine']):.3f} · {s['n_faces']} faces"
+            f"{shared_note}</div></div>")
+    action = ("<button onclick='mergeSimilar()'>merge selected into this "
+              "cluster</button>" if confirmed else
+              "<i>confirm this cluster to enable merging</i>")
+    return (f"<div class='similar'><b>Similar clusters</b> — same person? "
+            f"{action}{''.join(rows)}</div>")
 
 
 def render_group(run_id: str, cluster_id: str, cluster_label: str,
                  faces: list, *, identity: dict | None, rejected: bool,
                  removed_keys: set, recent_events: list, page: int = 0,
-                 sort: str = "central") -> str:
+                 sort: str = "central", similar: list | None = None) -> str:
     """faces: dicts with face_key, source_file_id, crop_file_name, track_id,
     similarity_to_cluster (may be ''). identity: {'identity_id','name'} when
-    confirmed. recent_events: [{'event_id','type','summary'}] newest first."""
+    confirmed. recent_events: [{'event_id','type','summary'}] newest first.
+    similar: neighbor suggestions (cluster_id, label, n_faces, cosine,
+    shared_events, status, name, medoid) for the merge-discovery strip."""
     def sim(face):
         try:
             return float(face.get("similarity_to_cluster") or 0.0)
@@ -335,6 +391,9 @@ def render_group(run_id: str, cluster_id: str, cluster_label: str,
         f"(minus removed)</button>"
         f"<button class='danger' onclick='rejectGroup()'>Reject group</button>"
         f"<span>{len(removed_keys)} removed</span></div>"
+        + (_similar_strip(similar,
+                          confirmed=identity is not None and not rejected)
+           if similar else "")
         + _pager(f"/group/{cluster_id}", page, n_pages)
         + f"<div class='grid'>{''.join(cards)}</div>"
         + _pager(f"/group/{cluster_id}", page, n_pages)
@@ -393,6 +452,79 @@ def render_queue(run_id: str, proposals: list, decided_keys: set) -> str:
             f"the whole track, reject records a cannot-link so it is never "
             f"proposed again</div>" + "".join(sections))
     return _page(f"Queue — {run_id}", body, _QUEUE_SCRIPT)
+
+
+MERGES_PER_PAGE = 100
+
+_MERGES_SCRIPT = """
+async function mergePair(btn, a, b) {
+  if (!confirm('Merge these two identities as one person?')) return;
+  btn.disabled = true;
+  const res = await fetch('/api/mark', {method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({action: 'merge_cluster_identities',
+                          cluster_ids: [a, b]})});
+  if (!res.ok) { alert('merge failed: ' + await res.text());
+                 btn.disabled = false; return; }
+  location.reload();
+}
+"""
+
+
+def render_merges(run_id: str, pairs: list, page: int = 0) -> str:
+    """Corpus-wide merge candidates: both-confirmed cluster pairs by
+    descending centroid cosine. pairs: dicts with cosine, shared_events,
+    merged (already same canonical identity), clusters=[{cluster_id, label,
+    n_faces, name, medoid} x2]."""
+    n_pages = max(1, -(-len(pairs) // MERGES_PER_PAGE))
+    page = max(0, min(page, n_pages - 1))
+    visible = pairs[page * MERGES_PER_PAGE:(page + 1) * MERGES_PER_PAGE]
+
+    n_open = sum(1 for p in pairs if not p["merged"])
+    rows = []
+    for pair in visible:
+        sides = []
+        for c in pair["clusters"]:
+            thumb = (f"<img src='{html.escape(crop_src(c['medoid']), quote=True)}' "
+                     f"loading='lazy'>" if c["medoid"] else "")
+            sides.append(
+                f"{thumb}<div><a href='/group/{c['cluster_id']}'>"
+                f"{html.escape(c['label'])}</a> "
+                f"<span class='badge confirmed'>"
+                f"{html.escape(c['name'] or '(unnamed)')}</span><br>"
+                f"{c['n_faces']} faces</div>")
+        try:
+            shared = int(pair["shared_events"] or 0)
+        except ValueError:
+            shared = 0
+        shared_note = (f" · <b>{shared} shared event(s)</b>" if shared else "")
+        a, b = (c["cluster_id"] for c in pair["clusters"])
+        action = ("<span class='badge confirmed'>merged</span>"
+                  if pair["merged"] else
+                  f"<button class='primary' onclick=\"mergePair(this, "
+                  f"'{html.escape(str(a), quote=True)}', "
+                  f"'{html.escape(str(b), quote=True)}')\">"
+                  f"same person</button>")
+        rows.append(
+            f"<div class='pair-row' "
+            f"style='{'opacity:.4' if pair['merged'] else ''}'>"
+            + "".join(sides)
+            + f"<div>cos {float(pair['cosine']):.3f}{shared_note}</div>"
+            + f"<div>{action}</div></div>")
+
+    if not pairs:
+        rows.append("<p><i>No both-confirmed similar pairs yet — confirm "
+                    "more clusters, or regenerate cluster_neighbors.csv "
+                    "with a lower --min-cos.</i></p>")
+    body = (f"<h1><a href='/'>&larr;</a> Merge candidates — run "
+            f"{html.escape(run_id)}</h1>"
+            f"<div class='sub'>{len(pairs)} both-confirmed pairs by centroid "
+            f"similarity, {n_open} still separate · merging pools members "
+            f"for growth and is undoable per pair</div>"
+            + _pager("/merges", page, n_pages)
+            + "".join(rows)
+            + _pager("/merges", page, n_pages))
+    return _page(f"Merges — {run_id}", body, _MERGES_SCRIPT)
 
 
 def _proposal_row(prop: dict, decided: bool) -> str:
